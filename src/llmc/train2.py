@@ -76,7 +76,9 @@ class Config2:
     contract: str = "truth"  # none | truth | anchor
     contract_weight: float = 0.1
     # pressure (from inject_step on; applied even with program=none for fair comparison)
-    pressure: str = "none"  # none | sparsity | redo | sparsity+redo
+    # none | sparsity (inject..end) | window (inject..end of A) | window+recycle
+    # (window, then reinit all pruned units fresh at the start of B) | redo (activation-based)
+    pressure: str = "none"
     l1: float = 3e-4  # group-lasso coefficient
     redo_every: int = 250
     redo_tau: float = 0.05
@@ -166,6 +168,47 @@ def redo(model, stats: ActStats, opt, tau: float):
     return n_reset
 
 
+def _zero_adam(opt, p, idx):
+    st = opt.state.get(p, {})
+    for key in ("exp_avg", "exp_avg_sq"):
+        if key in st:
+            st[key][idx] = 0
+
+
+@torch.no_grad()
+def recycle(model, opt, eps):
+    """Reinitialize every unit whose group norm is below eps: fresh input
+    weights, zero output weights (so the function is unchanged at reset)."""
+    counts = {}
+    for li, blk in enumerate(model.blocks):
+        W1, b1, W2 = blk.mlp[0].weight, blk.mlp[0].bias, blk.mlp[2].weight
+        dead = torch.cat([W1, b1[:, None], W2.T], 1).norm(dim=1) <= eps
+        fresh = torch.empty_like(W1)
+        nn.init.kaiming_uniform_(fresh, a=math.sqrt(5))
+        W1[dead], b1[dead], W2[:, dead] = fresh[dead], 0, 0
+        for p, idx in ((W1, (dead,)), (b1, (dead,)), (W2, (slice(None), dead))):
+            _zero_adam(opt, p, idx)
+        counts[f"mlp{li}"] = int(dead.sum())
+        D, H = blk.qkv.weight.shape[1], blk.n_heads
+        hd = D // H
+        norms = unit_groups(model)[2 * li + 1][2].norm(dim=1)
+        fresh = torch.empty_like(blk.qkv.weight)
+        nn.init.kaiming_uniform_(fresh, a=math.sqrt(5))
+        nh = 0
+        for h in range(H):
+            if norms[h] <= eps:
+                for part in range(3):
+                    sl = slice(part * D + h * hd, part * D + (h + 1) * hd)
+                    blk.qkv.weight[sl] = fresh[sl]
+                    blk.qkv.bias[sl] = 0
+                    _zero_adam(opt, blk.qkv.weight, (sl,))
+                blk.proj.weight[:, h * hd:(h + 1) * hd] = 0
+                _zero_adam(opt, blk.proj.weight, (slice(None), slice(h * hd, (h + 1) * hd)))
+                nh += 1
+        counts[f"head{li}"] = nh
+    return counts
+
+
 # ---------------------------------------------------------------- eval
 def make_evals(task: MultiScan, cfg: Config2):
     g = torch.Generator().manual_seed(12345)
@@ -230,6 +273,12 @@ def train(cfg: Config2):
 
     for step in range(total + 1):
         pressure_on = step >= cfg.inject_step and cfg.pressure != "none"
+        if cfg.pressure.startswith("window") and step >= cfg.steps_A:
+            pressure_on = False
+        if step == cfg.steps_A and cfg.pressure == "window+recycle":
+            n = recycle(model, opt, cfg.prune_eps)
+            events.append(dict(step=step, event="recycle", **n))
+            print(f"[{cfg.name}] step {step}: recycled {n}", flush=True)
         if step == cfg.inject_step:
             if cfg.program != "none":
                 prog = build_program(cfg.program, cfg.V)
@@ -281,7 +330,7 @@ def train(cfg: Config2):
         loss, _, _ = loss_and_acc(model(b.tokens), b)
         if contract is not None:
             loss = loss + contract.loss(model)
-        if pressure_on and "sparsity" in cfg.pressure:
+        if pressure_on and ("sparsity" in cfg.pressure or cfg.pressure.startswith("window")):
             loss = loss + cfg.l1 * group_lasso(model)
         opt.zero_grad(set_to_none=True)
         loss.backward()
