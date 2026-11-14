@@ -126,3 +126,37 @@ summod_pair (failed in M2) is solved by code→code composition through slots.
 Caveat: every ladder task is exactly expressible by composing generic ops, so the network only routes and
 the teacher does the algorithmic work; growth was never needed. Testing grow-vs-code needs tasks that
 are *not* cheaply codeable (statistical / soft structure), with an MDL-style cost for code + tables vs weights.
+
+## M4 — grow on demand where code can't help (hidden grammar), then partly can (planted copies)
+`lm.py`: next-token LM from an empty core (1 block, 0 heads, 0 MLP, d=16). Trial-based growth: on a
+plateau, try +1 head / +8 MLP per layer / +1 layer (1 head, 8 MLP) for 1000 steps each against a
+no-growth control from identical state and data; grow only if a candidate beats the control by >0.005
+nats, choosing best gain per added param; stop when nothing beats the control.
+
+Data: random HMM (16 states, 2 successors each, 16 tokens, emission Dirichlet α=0.1) with secret
+parameters → not codeable by the teacher. Exact Bayes-optimal loss via the forward algorithm: 1.695
+(unigram 2.42).
+
+### Pure HMM: grown vs fixed
+| model | core params | loss | gap to Bayes |
+|---|---|---|---|
+| fixed 1 layer, 1 head | 1,136 | 2.055 | 0.360 |
+| fixed 1 layer, 2 heads, 32 MLP | 2,704 | 2.047 | 0.352 |
+| fixed 2 layers, 2 heads, 32 MLP | 4,864 | 1.890 | 0.195 |
+| **grown** → 6 layers ≈1 head each, MLP 0–16 | 6,192 | **1.778** | **0.083** |
+
+Growth path: +head → +layer → +layer → +head → +8mlp → +layer ×3 → stop. The policy discovers that this
+task wants **depth, not width** (iterated belief updates); fixed references confirm width barely helps.
+
+### HMM + planted copy spans (50% of sequences repeat an earlier 4–8 token span after a COPY marker)
+Code = generic `suffix_next` / `suffix_len` ops (continuation + length of the longest earlier suffix
+match), read at site 0. Both grown from empty.
+
+| run | final core | loss all | copy-span tokens | grammar tokens |
+|---|---|---|---|---|
+| grown, no code | 4,776 | 1.871 | 2.094 | 1.858 |
+| grown + suffix-match code | **4,200** | **1.821** | **1.672** | 1.829 |
+
+Code improves copy-span loss and ends with a 12% smaller core. But copied tokens are deterministic
+(ideal ≈ 0): the network doesn't fully trust the op because short spurious suffix matches are common in
+HMM text and it can't tell it's inside a copy span — again an interface/routing bottleneck, not compute.
