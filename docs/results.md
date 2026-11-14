@@ -43,3 +43,32 @@ Takeaways:
 - Differentiability of the program doesn't matter once the interface is set; the interface is the bottleneck.
 
 ![m1b](img/m1b_curves.png)
+
+## M2 — does moving skill A into code free capacity for skill B? (disjoint B)
+Multitask NoPE GPT, d=32, 2 layers (26.5k neural params). Task token prefixes each sequence.
+A = {summod, max} for 2000 steps; module (routed gate, teacher interface, truth contract) injected at 800.
+B = {induct, count_eq, lag2} for 3000 steps with 30% A replay. Pressure arms from step 800:
+`window` = group lasso (l1 3e-3) on MLP neurons + heads until end of A; `recycle` = reinit all units with
+group norm < 0.05 at start of B; `sparsity` = group lasso for the whole run. 3 seeds (`scripts/milestone2.sh`).
+
+| arm | A id | A ood | B id (per seed) | B auc | core params end |
+|---|---|---|---|---|---|
+| no module | 0.917 | 0.536 | 0.526 (0.54/0.51/0.53) | 0.394 | 26.5k |
+| no module + window+recycle | 0.916 | 0.540 | 0.539 | 0.413 | 26.5k |
+| control module | 0.921 | 0.541 | 0.536 | 0.401 | 26.5k |
+| **py module** | 0.999 | 0.994 | **0.711** (0.67/0.74/0.73) | **0.514** | 26.5k |
+| soft module | 0.999 | 0.992 | 0.711 | 0.514 | 26.5k |
+| py + window (prune, no recycle) | 1.000 | 0.984 | 0.521 | 0.413 | 17.6k |
+| py + window+recycle | 0.999 | 0.954 | 0.721 | 0.513 | 26.5k |
+| py + continuous sparsity | 0.999 | 0.928 | 0.459 | 0.358 | 9.9k |
+
+(Calibration, 1 seed: no module at d=48 / 58k params got B id 0.62.)
+
+Takeaways:
+- Externalizing sum-mod raises B learning by ~18 points with non-overlapping seeds; the control rules
+  out "just more params". It beat a 2.2× wider network (1 seed).
+- With the module, A needs almost no MLP: during the prune window 118–128/128 neurons died in both layers
+  while A stayed ~perfect (attention + code carry A).
+- Explicit prune→recycle gave no gain over plain continued training — gradient descent already reallocates.
+  Pruning without recycling hurts (dead units stay dead). Continuous sparsity gives a 63% smaller core
+  that holds A but can't learn B: there's a real core-size vs. new-learning trade-off.
