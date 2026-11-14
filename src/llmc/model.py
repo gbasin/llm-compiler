@@ -81,15 +81,17 @@ class GPT(nn.Module):
         x = self.tok_emb(idx)
         if self.pos_emb is not None:
             x = x + self.pos_emb(torch.arange(T, device=idx.device))
-        pending: dict[int, list[torch.Tensor]] = {}
+        pending: dict[int, list] = {}
         resid = []
         L = self.cfg.n_layers
         for i in range(L + 1):
             for m in self.injections:
                 if m.read == i and m.enabled:
-                    pending.setdefault(m.write, []).append(m(x))
-            for c in pending.pop(i, []):
-                x = x + c
+                    pending.setdefault(m.write, []).append((m, m.compute(x)))
+            if i in pending:
+                h = x  # all modules writing here see the same pre-write stream
+                for m, z in pending.pop(i):
+                    x = x + m.gate_value(h) * z
             if capture:
                 if x.requires_grad:
                     x.retain_grad()
