@@ -96,3 +96,33 @@ Takeaways:
   d=32 NoPE block 0 can't produce x_i·x_{i-1} at site 1. The bottleneck is building the input
   representation, not the computation — the case where the teacher would need another code primitive
   (e.g. a `prev_token` module feeding a `mul_mod` module), i.e. module composition.
+
+## M3 — register file + curriculum ladder, code-first continual learning
+Hybrid model (`hybrid.py`): growable core + register file of per-position int slots shared by code
+(`oplib.py` generic ops: xval, task, shift, add/mul/cumsum mod, cummax, eq, mask, map-table,
+count_prefix_eq, prev_occ_next, isitem), readers (zero-init lookup table + router; no zero-gate saddle)
+and contract-trained decoders. Ladder (`scripts/ladder_m3.sh`): 9 tasks added one per stage, 50% replay of
+all earlier tasks; a stage ends when the new task is ≥0.99 id / ≥0.95 ood **and** no earlier task dropped
+>1 pt (id or ood).
+
+Core: 1 block with **0 heads, 0 MLP**, d=16 → 752 params (embeddings + unembedding).
+Without code this core gets summod to 14% and, given max next, forgets summod (−43 pts) while learning nothing.
+
+| stage | task | plan (ops → reader) | steps | core | interface params | ops | table entries | worst regression |
+|---|---|---|---|---|---|---|---|---|
+| 0 | summod | xval, cumsum_mod | 200 | 752 | 129 | 2 | 0 | – |
+| 1 | max | task(+reader@0 for routing), cummax | 200 | 752 | 627 | 4 | 0 | 0 |
+| 2 | lag1 | shift | 100 | 752 | 756 | 5 | 0 | 0 |
+| 3 | summod_pair | mul_mod(x, shift x), cumsum_mod | 200 | 752 | 885 | 7 | 0 | 0 |
+| 4 | summod_even | map[0,0,2,0,4], cumsum_mod | 200 | 752 | 1014 | 9 | 5 | 0 |
+| 5 | depth | isitem, map[1,4,0,0,0], mask, cumsum_mod | 200 | 752 | 1143 | 13 | 10 | 0 |
+| 6 | count_eq | count_prefix_eq(tok) | 200 | 752 | 1272 | 14 | 10 | 0 |
+| 7 | lag2 | shift k=2 | 200 | 752 | 1401 | 15 | 10 | 0 |
+| 8 | induct | prev_occ_next(tok, x) | 200 | 752 | 1530 | 16 | 10 | 0 |
+
+All 9 tasks end at 1.00 id and 1.00 ood (2× train length), zero regression at every stage, core never grew.
+summod_pair (failed in M2) is solved by code→code composition through slots.
+
+Caveat: every ladder task is exactly expressible by composing generic ops, so the network only routes and
+the teacher does the algorithmic work; growth was never needed. Testing grow-vs-code needs tasks that
+are *not* cheaply codeable (statistical / soft structure), with an MDL-style cost for code + tables vs weights.

@@ -50,6 +50,17 @@ def _lag2(x, V):
     return y
 
 
+def _lag1(x, V):
+    y = torch.zeros_like(x)
+    y[:, 1:] = x[:, :-1]
+    return y
+
+
+def _depth(x, V):
+    # bracket depth mod V: 0 opens, 1 closes, others neutral
+    return torch.cumsum((x == 0).long() - (x == 1).long(), 1) % V
+
+
 def _summod_even(x, V):
     return torch.cumsum(torch.where(x % 2 == 0, x, 0), 1) % V
 
@@ -60,7 +71,7 @@ def _summod_pair(x, V):
     return torch.cumsum(x * prev, 1) % V
 
 
-FNS = dict(summod=_summod, max=_max, induct=_induct, count_eq=_count_eq, lag2=_lag2,
+FNS = dict(summod=_summod, max=_max, induct=_induct, count_eq=_count_eq, lag2=_lag2, lag1=_lag1, depth=_depth,
            summod_even=_summod_even, summod_pair=_summod_pair)
 
 
