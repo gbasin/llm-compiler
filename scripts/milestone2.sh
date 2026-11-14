@@ -11,7 +11,21 @@ esac
 OUT=runs/m2_${B:-disjoint}
 COMMON="--d_model 32 --steps_A 2000 --steps_B 3000 --inject_step 800 --l1 3e-3 --tasks_B $TB --out_dir $OUT"
 jobs_=()
-for s in $SEEDS; do
+if [ "${B:-disjoint}" = comp ]; then
+  for s in $SEEDS; do
+    jobs_+=("--name base_none_s$s --seed $s")
+    jobs_+=("--name py_none_s$s --seed $s --program py_summod")
+    # teacher proposes a new contract at site 1 for the existing sum-mod code
+    jobs_+=("--name py+py2contract_s$s --seed $s --program py_summod --program2 py_summod")
+    # same new module, no contract: frozen probe-init interface only
+    jobs_+=("--name py+py2nocontract_s$s --seed $s --program py_summod --program2 py_summod --contract2 none")
+    # soft code at site 1, no contract: can gradient through code discover the feature?
+    jobs_+=("--name py+soft2nocontract_s$s --seed $s --program py_summod --program2 soft_summod --contract2 none")
+    # control: contract supervision with no algorithm behind it
+    jobs_+=("--name py+control2contract_s$s --seed $s --program py_summod --program2 control")
+  done
+fi
+for s in $( [ "${B:-disjoint}" = comp ] || echo $SEEDS ); do
   jobs_+=("--name base_none_s$s --seed $s")
   jobs_+=("--name base_window+recycle_s$s --seed $s --pressure window+recycle")
   jobs_+=("--name py_none_s$s --seed $s --program py_summod")

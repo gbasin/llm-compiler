@@ -29,10 +29,10 @@ def fit_probe_W(X: torch.Tensor, y: torch.Tensor, n_cls: int, lam: float = 1e-2)
 
 
 @torch.no_grad()
-def probe_init_in(module, model, task, batch, scale: float = 10.0):
+def probe_init_in(module, model, task, batch, scale: float = 10.0, label_fn=None):
     _, resid = model(batch.tokens, capture=True)
     X = module.ln(resid[module.read])
-    y = task.code_inputs(batch)
+    y = (label_fn or task.code_inputs)(batch)
     sel = y >= 0
     w, b = fit_probe_W(X[sel].float(), y[sel], module.program.in_dim)
     module.W_in.weight.copy_(scale * w)

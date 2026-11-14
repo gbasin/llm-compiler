@@ -108,6 +108,25 @@ class MultiScan:
         is_task = (tok >= 2 * self.V) & (tok < self.PAD)
         return torch.where(is_task, torch.zeros_like(tok), lab)
 
+    def comp_inputs(self, batch: Batch) -> torch.Tensor:
+        """Teacher-proposed contract for the compositional B tasks: the per-item
+        value whose running sum mod V is the answer (task token -> 0, other
+        tasks -> -1 = don't care)."""
+        tok = batch.tokens
+        x = tok[:, 1:]
+        prev = torch.zeros_like(x)
+        prev[:, 1:] = x[:, :-1]
+        lab = torch.full_like(tok, -1)
+        for name, f in (("summod_even", lambda: torch.where(x % 2 == 0, x, 0)),
+                        ("summod_pair", lambda: (x * prev) % self.V)):
+            if name not in self.tid:
+                continue
+            sel = tok[:, 0] == self.tid[name]
+            lab[sel, 0] = 0
+            lab[sel, 1:] = f()[sel]
+        valid = (tok < self.V) | ((tok >= 2 * self.V) & (tok < self.PAD))
+        return torch.where(valid, lab, torch.full_like(lab, -1))
+
     def probe_targets(self, batch: Batch) -> dict[str, torch.Tensor]:
         tok = batch.tokens
         return {"current_x": torch.where(tok < self.V, tok, torch.full_like(tok, -1)),

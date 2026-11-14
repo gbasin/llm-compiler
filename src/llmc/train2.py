@@ -72,6 +72,11 @@ class Config2:
     gate_mode: str = "routed"
     gate_init: float = 0.0
     out_scale: float = 20.0
+    # optional second module (teacher redesign for compositional B)
+    program2: str = "none"
+    inject2_step: int = -1  # -1: start of phase B
+    read2: int = 1
+    contract2: str = "truth"  # none | truth  (labels from task.comp_inputs)
     # contract
     contract: str = "truth"  # none | truth | anchor
     contract_weight: float = 0.1
@@ -265,6 +270,8 @@ def train(cfg: Config2):
     g = torch.Generator().manual_seed(cfg.seed)
     total = cfg.steps_A + cfg.steps_B
     contract, stats, events = None, None, []
+    contracts = []
+    inject2 = cfg.steps_A if cfg.inject2_step < 0 else cfg.inject2_step
     t0 = time.time()
 
     def sample(names, n):
@@ -296,8 +303,24 @@ def train(cfg: Config2):
                                                weight=cfg.contract_weight)
                 events.append(dict(step=step, event="inject", probe_fit=fit, **m.describe()))
                 print(f"[{cfg.name}] step {step}: injected {m.describe()} probe_fit={fit:.3f}", flush=True)
+            if contract is not None:
+                contracts.append(contract)
             if "redo" in cfg.pressure:
                 stats = ActStats(model)
+        if step == inject2 and cfg.program2 != "none":
+            prog = build_program(cfg.program2, cfg.V)
+            m2 = model.inject(CodeModule(cfg.d_model, prog, cfg.read2, cfg.n_layers, cfg.gate_init,
+                                         name=cfg.program2 + "_2", gate_mode=cfg.gate_mode))
+            fit = probe_init_in(m2, model, task, sample(B, 512), label_fn=task.comp_inputs)
+            unembed_init_out(m2, model, task, cfg.out_scale)
+            opt.add_param_group(dict(params=[p for n, p in m2.named_parameters() if n != "gate"],
+                                     lr=cfg.module_lr, weight_decay=cfg.weight_decay))
+            opt.add_param_group(dict(params=[m2.gate], lr=cfg.module_lr, weight_decay=0.0))
+            if cfg.contract2 == "truth":
+                contracts.append(Contract.create(m2, model, sample(B, 128), "truth", task.comp_inputs,
+                                                 weight=cfg.contract_weight))
+            events.append(dict(step=step, event="inject2", probe_fit=fit, **m2.describe()))
+            print(f"[{cfg.name}] step {step}: injected2 {m2.describe()} probe_fit={fit:.3f}", flush=True)
         for grp in opt.param_groups:
             grp.setdefault("base_lr", grp["lr"])
             grp["lr"] = grp["base_lr"] * lr_mult(step, total, cfg.warmup)
@@ -307,12 +330,14 @@ def train(cfg: Config2):
             rec = dict(step=step, phase="A" if step < cfg.steps_A else "B", time=round(time.time() - t0, 1),
                        eval=ev, core=core_size(model, cfg.prune_eps),
                        gates={m.name: float(m.gate.detach()) for m in model.injections})
-            if contract is not None:
-                rec["contract"] = contract.maintain(model)
+            if contracts:
+                rec["contracts"] = [c.maintain(model) for c in contracts]
+                rec["contract"] = rec["contracts"][0]
             mf.write(json.dumps(rec) + "\n"); mf.flush()
             short = " ".join(f"{t}={ev[t]['id']:.2f}/{ev[t]['ood']:.2f}" for t in task.tasks)
             print(f"[{cfg.name}] {step:5d} {rec['phase']} {short} core={rec['core']['core_params']}"
-                  + (f" contract={rec['contract']['agree']:.3f}" if contract else ""), flush=True)
+                  + (" contracts=" + ",".join(f"{c['agree']:.3f}" for c in rec["contracts"]) if contracts else ""),
+                  flush=True)
         if step == total:
             break
 
@@ -328,8 +353,8 @@ def train(cfg: Config2):
                       torch.cat([pad(ba.mask, False), pad(bb.mask, False)]),
                       torch.cat([ba.lengths, bb.lengths]))
         loss, _, _ = loss_and_acc(model(b.tokens), b)
-        if contract is not None:
-            loss = loss + contract.loss(model)
+        for c in contracts:
+            loss = loss + c.loss(model)
         if pressure_on and ("sparsity" in cfg.pressure or cfg.pressure.startswith("window")):
             loss = loss + cfg.l1 * group_lasso(model)
         opt.zero_grad(set_to_none=True)
@@ -343,7 +368,7 @@ def train(cfg: Config2):
 
     final = evaluate(model, sets)
     summary = dict(name=cfg.name, final=final, core=core_size(model, cfg.prune_eps), events=events,
-                   refits=contract.refits if contract else 0)
+                   refits=sum(c.refits for c in contracts))
     if model.injections:
         for m in model.injections:
             m.enabled = False
