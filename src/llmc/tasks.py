@@ -70,6 +70,13 @@ class InterleavedScan:
         targets = torch.where(mask, targets, torch.full_like(targets, -100))
         return Batch(tokens, targets, mask, lengths)
 
+    def code_inputs(self, batch: Batch) -> torch.Tensor:
+        """Labels a scan program should read per position: x at item
+        positions, 0 (identity for max and sum) at BOS, -1 (ignore) at PAD."""
+        tok = batch.tokens
+        lab = torch.where(tok < self.V, tok, torch.full_like(tok, -1))
+        return torch.where(tok == self.BOS, torch.zeros_like(tok), lab)
+
     # ground-truth intermediate quantities, used by probes ---------------------
     def probe_targets(self, batch: Batch) -> dict[str, torch.Tensor]:
         """Per-position integer labels (or -1 where undefined)."""

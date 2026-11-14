@@ -16,5 +16,6 @@ for s in $SEEDS; do
   jobs_+=("--name py_inject1000_s$s --seed $s --inject_step 1000 --program py_summod")
   jobs_+=("--name control_inject1000_s$s --seed $s --inject_step 1000 --program control")
 done
-printf '%s\n' "${jobs_[@]}" | xargs -P ${PAR:-6} -I{} sh -c "uv run python -m llmc.train $COMMON {} > /dev/null 2>&1 && echo done: {}"
+# -L1: one job per line, words appended (avoids macOS xargs -I 255-byte limit)
+printf '%s\n' "${jobs_[@]}" | xargs -P "${PAR:-6}" -L1 uv run python -m llmc.train $COMMON | grep -E "done in|injected"
 uv run python scripts/plot.py $OUT

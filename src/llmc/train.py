@@ -20,6 +20,7 @@ import torch
 import torch.nn.functional as F
 
 from .model import GPT, GPTConfig
+from .interface import probe_init_in, unembed_init_out
 from .modules import CodeModule
 from .programs import build_program
 from .tasks import Batch, make_task
@@ -58,6 +59,9 @@ class Config:
     read: int = 0
     write: int = -1  # -1: last site (n_layers)
     gate_init: float = 0.0
+    init_in: str = "random"  # random | probe   (see interface.py)
+    init_out: str = "random"  # random | unembed
+    out_scale: float = 1.0
     out_dir: str = "runs"
 
 
@@ -171,6 +175,11 @@ def train(cfg: Config):
             if step > 0:
                 save_ckpt(out / "pre_inject.pt", cfg, model)
             m = make_module(cfg, model, device)
+            if cfg.init_in == "probe":
+                pb = task.sample(torch.randint(cfg.train_len_min, cfg.train_len_max + 1, (512,), generator=g), g).to(device)
+                print(f"[{cfg.name}] probe-init W_in, fit acc {probe_init_in(m, model, task, pb):.3f}")
+            if cfg.init_out == "unembed":
+                unembed_init_out(m, model, task, cfg.out_scale)
             gate = [m.gate]
             rest = [p for n, p in m.named_parameters() if n != "gate"]
             opt.add_param_group(dict(params=rest, lr=cfg.module_lr, weight_decay=cfg.weight_decay))
