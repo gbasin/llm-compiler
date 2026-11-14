@@ -72,3 +72,27 @@ Takeaways:
 - Explicit prune→recycle gave no gain over plain continued training — gradient descent already reallocates.
   Pruning without recycling hurts (dead units stay dead). Continuous sparsity gives a 63% smaller core
   that holds A but can't learn B: there's a real core-size vs. new-learning trade-off.
+
+## M2 — compositional B: reuse the sum-mod code on a feature the network must build
+B = {summod_even: Σ x_j·[x_j even] mod 5, summod_pair: Σ x_j·x_{j-1} mod 5}. At the start of B the teacher
+inserts a second instance of the *same* sum-mod code reading site 1 (after block 0), with a new contract
+whose labels are the per-item summand ("x if even else 0", "x·x_{i-1} mod 5"). 3 seeds.
+
+| arm | even id/ood | pair id/ood | even ood w/ modules ablated |
+|---|---|---|---|
+| no module | 0.90 / 0.16 | 0.18 / 0.00 | – |
+| py A-module only | 0.96 / 0.28 | 0.21 / 0.00 | 0.28 |
+| + py2 @site1, frozen probe interface (no contract) | 0.97 / 0.30 | 0.20 / 0.00 | 0.30 |
+| + control2 @site1 + contract (supervision, no algorithm) | 0.94 / 0.21 | 0.20 / 0.00 | 0.11 |
+| **+ py2 @site1 + teacher contract** | **1.00 / 0.99** | 0.21 / 0.00 | 0.00 |
+| **+ soft2 @site1, no contract (gradient through code)** | **1.00 / 0.99** | 0.22 / 0.00 | 0.00 |
+
+Takeaways:
+- A new contract teaches the network to *build* the input the existing code needs ("x if even else 0")
+  and route it into non-differentiable code: 0.28 → 0.99 ood, full dependence. The contract-only control
+  shows this is not just auxiliary supervision.
+- For this simple feature, gradient through soft code discovers the same thing without a contract.
+- summod_pair fails in every arm. Contract agreement plateaus at ~0.88 (the even part only): the
+  d=32 NoPE block 0 can't produce x_i·x_{i-1} at site 1. The bottleneck is building the input
+  representation, not the computation — the case where the teacher would need another code primitive
+  (e.g. a `prev_token` module feeding a `mul_mod` module), i.e. module composition.
