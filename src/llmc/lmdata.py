@@ -22,6 +22,11 @@ import torch
 class HMMSource:
     def __init__(self, vocab: int = 16, states: int = 8, branch: int = 3, emit_alpha: float = 0.2,
                  seed: int = 0, p_copy: float = 0.0, copy_len: tuple[int, int] = (4, 8)):
+        with torch.random.fork_rng():
+            torch.manual_seed(seed)  # Dirichlet draws use the global RNG; pin it
+            self._init(vocab, states, branch, emit_alpha, seed, p_copy, copy_len)
+
+    def _init(self, vocab, states, branch, emit_alpha, seed, p_copy, copy_len):
         g = torch.Generator().manual_seed(seed)
         self.states, self.p_copy, self.copy_len = states, p_copy, copy_len
         self.n_base = vocab
