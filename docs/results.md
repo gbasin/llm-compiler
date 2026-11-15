@@ -461,3 +461,27 @@ This version gives it what doubleAI used gradients for, plus a fast check:
   new kinds of code. The clusters mostly show word-start and mid-word uncertainty, which no exact
   rule removes.
 - **Single run,** so ±0.005 between iterations is close to seed noise (see the hygiene section).
+
+### Scorer fix: score tables on text they never counted
+`score` now rebuilds every table from the first 90% of the training text, trains the new parameters there,
+and reports the change in eval mode on the last 10%, which no table has seen. Ops that read the corpus
+themselves must honour `CTX_FRAC`. Check: swap 9 tables into the final fast1 model and compare with a full
+4000-step trial using that table alone.
+
+| table | old score (train text) | new score (unseen dev) | table-only val | full trial val |
+|---|---|---|---|---|
+| wb4 | +0.224 | +0.121 | 1.681 | 1.623 |
+| wb6 | −0.035 | +0.081 | 1.779 | 1.545 |
+| wb8 | −0.239 | +0.086 | 1.943 | 1.534 |
+| kn6 | −0.062 | +0.032 | 1.565 | 1.522 |
+| kn7 | −0.184 | +0.040 | 1.566 | 1.520 |
+| wkn2 | −0.161 | +0.036 | 1.578 | 1.517 |
+| wkn23 | −0.337 | +0.033 | 1.587 | 1.513 |
+| k6d120c | −0.018 | +0.022 | 1.549 | 1.514 |
+| omix5 (current) | +0.003 | −0.001 | 1.525 | 1.496 |
+
+Spearman correlation with the full trial: **old 0.17, new 0.85**, table-only val 0.70. The old scorer liked
+whichever table memorized most (wb8, wkn23). The new one puts the real winner first. Side notes: omix5
+alone trains to 1.4955, so fast1's two readers in iteration 6 added only ~0.004. And on the full trial the
+word table wkn23 (1.513) ties k6d120c, so the agent's rejection of word tables via table-only loss was also
+slightly off.

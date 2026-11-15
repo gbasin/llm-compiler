@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import os
 import shutil
 import subprocess
 import time
@@ -82,9 +83,20 @@ def trial_and_save(ws, seed=0):
     return res, dict(plan=plan, state=model.state_dict(), ops_src=(ws / "ops.py").read_text())
 
 
-def load_ckpt(ws):
+FIT_FRAC = 0.9  # score: tables/corpus stats fit on train[:90%], measured on the unseen last 10%
+
+
+def fit_split(src):
+    """Copy of src whose .train is the first FIT_FRAC of train (what tables may see) plus .dev, the rest."""
+    n = int(len(src.train) * FIT_FRAC)
+    f = copy.copy(src)
+    f.train, f.dev = src.train[:n], src.train[n:]
+    return f
+
+
+def load_ckpt(ws, src=None):
     ck = torch.load(ws / "ckpt.pt", weights_only=False)
-    src = CharSource("data/tinyshakespeare.txt")
+    src = src or CharSource("data/tinyshakespeare.txt")
     # build with the ops source the checkpoint was trained with
     tmp = ws / "_ckpt_ops"
     tmp.mkdir(exist_ok=True)
@@ -98,9 +110,12 @@ def sel_set(src):
     return src.sample(SEL_N, D.SEQ + 1, torch.Generator().manual_seed(SEL_SEED), split="train")
 
 
-def per_token_nll(model, X):
+def per_token_nll(model, X, eval_mode=False):
+    was = model.training
+    model.train(not eval_mode)
     with torch.no_grad():
         lg = model(X[:, :-1])
+    model.train(was)
     return F.cross_entropy(lg.flatten(0, 1), X[:, 1:].flatten(), reduction="none").view(X.shape[0], -1)
 
 
@@ -187,12 +202,19 @@ def diagnose(ws):
 
 
 def score(ws, cand_path, steps=150):
-    model, src, _ = load_ckpt(ws)
+    """Tables (base and candidate) are rebuilt from train[:FIT_FRAC]; new params train on that part;
+    the headline number is measured in eval mode on train[FIT_FRAC:], text no table has counted.
+    (Measuring on text the table was built from rewards memorization: it ranked tables backwards.)"""
+    os.environ["CTX_FRAC"] = str(FIT_FRAC)  # ops that read the corpus themselves must honour this
+    full = CharSource("data/tinyshakespeare.txt")
+    src = fit_split(full)
+    model, _, _ = load_ckpt(ws, src)
     labels = torch.load(ws / "clusters.pt")
-    X = sel_set(src)
-    Xh = src.sample(SEL_N, D.SEQ + 1, torch.Generator().manual_seed(SEL_SEED + 1), split="train")
+    X = sel_set(full)
+    gd = torch.Generator().manual_seed(SEL_SEED + 1)
+    Xd = torch.stack([src.dev[i:i + D.SEQ + 1] for i in torch.randint(0, len(src.dev) - D.SEQ - 1, (512,), generator=gd)])
     base = per_token_nll(model, X)
-    hbase = per_token_nll(model, Xh).mean()
+    dbase = per_token_nll(model, Xd, eval_mode=True).mean()
     for p in model.parameters():
         p.requires_grad_(False)
     cand = json.loads(Path(cand_path).read_text())
@@ -207,11 +229,12 @@ def score(ws, cand_path, steps=150):
         loss = F.cross_entropy(model(x[:, :-1], targets=x[:, 1:]).flatten(0, 1), x[:, 1:].flatten())
         opt.zero_grad(); loss.backward(); opt.step()
     after = per_token_nll(model, X)
-    hafter = per_token_nll(model, Xh).mean()
+    dafter = per_token_nll(model, Xd, eval_mode=True).mean()
     print(f"candidate {cand} ({time.time() - t0:.0f}s, {steps} steps, only new params trained)")
-    print(f"loss change, held-out train chars: {hafter - hbase:+.4f}  (selection set: {(after - base).mean():+.4f}; "
-          "negative = better; a full trial typically gains 1-3x this)")
-    rows = []
+    print(f"loss change on unseen dev text (last {1 - FIT_FRAC:.0%} of train, no table has counted it): "
+          f"{dafter - dbase:+.4f}  (negative = better; this is the number to trust, for tables too)")
+    rows = [f"per-cluster changes below are on the in-sample selection set (useful for WHICH failures "
+            f"moved, not for magnitude): overall {(after - base).mean():+.4f}"]
     for j in range(K):
         mk = labels == j
         if mk.any():
@@ -234,7 +257,9 @@ code (ops, lookup tables). Lower the validation loss below by editing ONLY {ws}/
   ops.py) and run
     uv run python -m llmc.discover_fast score --ws {ws} --cand {ws}/cand.json
   It adds those actions on top of the current trained model, trains only the new params briefly, and
-  prints the loss change overall and per cluster. Use it to test several ideas and variants, then put
+  prints the loss change on dev text no table has seen (tables are rebuilt from the first 90% of
+  train for scoring; ops that read the corpus directly must use only
+  train[:int(len(train) * float(os.environ.get("CTX_FRAC", "1.0")))]) and per cluster. Use it to test several ideas and variants, then put
   the winners into plan.json. (A table replaces the current one if the plan already has one.)
 ## Current state
 {state}
