@@ -100,7 +100,7 @@ class CallerCore(nn.Module):
 def chain(tok, n, kmax):
     """Ground-truth symbols after 0..kmax hops (for query labels)."""
     table = expert_table(tok, n)
-    s = tok[:, 2 * n + 1]  # QUERY at 2n, start symbol at 2n+1
+    s = tok[:, -1]  # start symbol is the last token
     cur, out = s, [s]
     for _ in range(kmax):
         cur = table.gather(1, cur[:, None])[:, 0]

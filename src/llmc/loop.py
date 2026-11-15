@@ -3,7 +3,7 @@ chasing as well as a stack of distinct blocks with T times the weights, and solv
 given more loops at test time?
 
 Task (generated): a random permutation P on N symbols shown as shuffled pairs "x P(x)", then
-QUERY s HOP^k PAD^(12-k); target = P^k(s) at the last position.
+HOP^k PAD^(12-k) QUERY s; target = P^k(s) at the last position.
 
 Models:
   stacked  : L distinct pre-LN blocks, one pass.
@@ -51,7 +51,7 @@ class PointerTask:
             nxt = P.gather(1, cur[:, None])[:, 0]
             cur = torch.where(k >= step, nxt, cur)
         slots = torch.where(torch.arange(self.kmax)[None] < k[:, None], self.HOP, self.PAD)
-        tok = torch.cat([pairs, torch.full((B, 1), self.QUERY), s[:, None], slots], 1)
+        tok = torch.cat([pairs, slots, torch.full((B, 1), self.QUERY), s[:, None]], 1)  # read out at s
         return tok, cur, k
 
 
