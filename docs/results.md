@@ -485,3 +485,65 @@ whichever table memorized most (wb8, wkn23). The new one puts the real winner fi
 alone trains to 1.4955, so fast1's two readers in iteration 6 added only ~0.004. And on the full trial the
 word table wkn23 (1.513) ties k6d120c, so the agent's rejection of word tables via table-only loss was also
 slightly off.
+
+## M8 — algorithm-only discovery on three corpora (`llmc/discover_gen.py`, `discover_gen2.py`)
+**Changes from M7:**
+- **No pre-written programs:** the agent starts from an empty `ops.py`. oplib's registry is cleared
+  before the agent's file loads, and the agent is denied repo source, docs and earlier runs (tested with
+  a live agent).
+- **No memorized knowledge:**
+  - no table actions;
+  - a static check bans file I/O and any import beyond torch, math and a few stdlib helpers;
+  - literal collections over 64 items and strings over 120 chars are rejected;
+  - ops see only the 128-char window.
+- **Three corpora at once:** Shakespeare, TinyStories and Python stdlib, 97-char vocab, 8000 steps,
+  batch 32×128. Score = mean val loss.
+- **Specialists count:** a change is kept if the mean improves > 0.005, or one corpus improves
+  > 0.015 and no corpus worsens > 0.005.
+- **Hidden transfer test:** Pile validation documents, never shown to the agent and never used for
+  decisions.
+- **Shrinking:** after each iteration the harness tries the next smaller core and adopts it if the mean
+  worsens by ≤ 0.01.
+- **Weight cap:** reader domains ≤ 128 values, and reader + logit-expert weights together ≤ 6000.
+- **v1:** the core has no positional encoding; code reaches the network only through readers.
+- **v2:** the core gets fixed sinusoidal positions, and ops can be **next-char experts**
+  (`{"logit": slot}`: a gated bonus on the char the op names, about 3d+2 weights).
+
+| setup | total weights | mean | Shakespeare | stories | Python | Pile (hidden) |
+|---|---|---|---|---|---|---|
+| v1 baseline: no code, no positions | 19.0k | 2.286 | 2.43 | 2.14 | 2.29 | 2.95 |
+| v1 best (iteration 3 of 8) | 25.0k | **1.718** | 1.99 | 1.49 | 1.68 | 2.54 |
+| v2 baseline: no code, positions | 19.0k | 1.935 | 2.11 | 1.72 | 1.98 | 2.74 |
+| control: no code, positions, 2x4x80 / 2x2x112 | 25.2k | 1.870 | 2.08 | 1.64 | 1.89 | 2.71–2.72 |
+| v2 best (iteration 7 of 8) | 25.0k | 1.760 | 2.03 | 1.53 | 1.72 | **2.52** |
+| v2 code on a smaller core (2x2x32), shrink rejected | ~20.7k | 1.805 | | | | 2.52 |
+
+**What the agents wrote, all from scratch:**
+- **v1:**
+  - previous 1 and 2 chars folded into about 35 classes;
+  - a copy expert (induction);
+  - position within the word;
+  - a line-layout parser (Python indentation, Shakespeare speaker lines).
+- **v2:**
+  - copy experts as next-char experts: min-match 1, 3 and 6, an alternate match, and word completion;
+  - Python specialists: an indentation predictor (spaces up to the previous line's indent, +4 after
+    `:`), the closer for the innermost bracket, the closer for an open quote, and a code-mode detector;
+  - word length and char-shape n-grams;
+  - a 24-bucket current-word hash, which the agent itself flagged as borderline memorization.
+
+**Findings:**
+- **At equal total weights, code beats more network.** v2 at 25.0k reaches 1.760 against 1.870 for
+  plain 25k cores. On the hidden Pile test it reaches 2.52 against 2.71. Even the 20.7k smaller core
+  with code (1.805) beats the plain 25k cores.
+- **About 0.35 of v1's 0.57 gain was positional information.** Giving the core positions alone takes it
+  from 2.286 to 1.935. v1 still ends up lowest overall (1.718): its explicit "previous chars" readers
+  appear to beat sinusoidal positions for a core this small.
+- **Experts take over exact structure, and the network keeps the lexical guessing.** The gains come from
+  copying, completion, indentation and closing brackets or quotes. The largest remaining failure is the
+  first letter of a new word, about 26% of hard-token loss. That is vocabulary knowledge, which rules
+  can't supply without memorizing.
+- **The 6000-weight interface cap bound from iteration 1 on, in both runs.** The agents fell back to
+  swaps the quick scorer can't test, because it only measures additions. And the shrink rule compared
+  against the best result with code rather than against plain cores of equal size. So no shrink was
+  ever adopted, even though smaller-core-plus-code is better than the plain larger core.
+- **Single seed throughout:** per-iteration differences under ~0.01 are noise.
