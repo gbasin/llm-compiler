@@ -162,3 +162,86 @@ def since(m, tok, value: int, cap: int = 15):
     last = torch.where(tok == value, idx, torch.full_like(idx, -10_000))
     last = torch.cummax(last, 1).values
     return (idx - last).clamp(max=cap + 1)
+
+
+# ---------------------------------------------------------------- text / arithmetic ops
+# These read characters through m.itos (set by the trainer for char-level data).
+NUMWORDS = {w: i for i, w in enumerate(
+    ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven",
+     "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen", "twenty"])}
+NUMWORDS["dozen"] = 12
+BIG = lambda m, s: 4096
+
+
+@op(BIG)
+def parse_num(m, tok):
+    """Causal: value of the digit run, or number word, that ends at position t (uses chars
+    <= t only), else -1. 'seven' inside 'seventeen' marks 7 at 'n' then 17 at the end."""
+    B, T = tok.shape
+    out = torch.full_like(tok, -1)
+    txt = ["".join(m.itos[i] if i < len(m.itos) else "#" for i in row) for row in tok.tolist()]
+    for b, s in enumerate(txt):
+        run_start = 0
+        for t in range(T):
+            c = s[t]
+            if t == 0 or (c.isdigit() != s[t - 1].isdigit()) or (c.isalpha() != s[t - 1].isalpha()):
+                run_start = t
+            if c.isdigit() and t - run_start < 3:
+                out[b, t] = int(s[run_start:t + 1])
+            elif c.isalpha():
+                w = s[run_start:t + 1].lower()
+                if w in NUMWORDS:
+                    out[b, t] = NUMWORDS[w]
+    return out
+
+
+@op(BIG)
+def hold(m, val, role, r: int):
+    """Latest val (>=0) at a position where role == r, carried forward; -1 before any."""
+    B, T = val.shape
+    idx = torch.arange(T, device=val.device).expand(B, T)
+    hit = (role == r) & (val >= 0)
+    last = torch.cummax(torch.where(hit, idx, torch.full_like(idx, -1)), 1).values
+    return torch.where(last >= 0, val.gather(1, last.clamp(min=0)), torch.full_like(val, -1))
+
+
+@op(BIG)
+def arith(m, a, b, opc):
+    """opc: 0 add, 1 sub, 2 mul. -1 if any input missing or result out of range."""
+    r = torch.where(opc == 0, a + b, torch.where(opc == 1, a - b, a * b))
+    bad = (a < 0) | (b < 0) | (opc < 0) | (opc > 2) | (r < 0) | (r >= 4096)
+    return torch.where(bad, torch.full_like(r, -1), r)
+
+
+@op(lambda m, s: len(m.itos) + 1)
+def render(m, val, pos):
+    """Char id of the next char to emit when writing str(val) followed by newline, given
+    pos = number of answer chars already emitted. -1 if val invalid."""
+    B, T = val.shape
+    out = torch.full_like(val, -1)
+    stoi = {c: i for i, c in enumerate(m.itos)}
+    for b in range(B):
+        for t in range(T):
+            v, p = int(val[b, t]), int(pos[b, t])
+            if v < 0 or p < 0:
+                continue
+            s = str(v) + "\n"
+            if p < len(s):
+                out[b, t] = stoi[s[p]]
+    return out
+
+
+@op(lambda m, s: 64)
+def since_char(m, tok, ch: str, cap: int = 62):
+    """Positions since the last occurrence of character `ch` (0 = here); cap+1 if none."""
+    c = m.itos.index(ch)
+    B, T = tok.shape
+    idx = torch.arange(T, device=tok.device).expand(B, T)
+    last = torch.cummax(torch.where(tok == c, idx, torch.full_like(idx, -10_000)), 1).values
+    return (idx - last).clamp(max=cap + 1)
+
+
+@op(lambda m, s: m.domains[s.inputs[0]])
+def offset(m, a, k: int):
+    """a + k (keeps -1 as missing when a < 0)."""
+    return torch.where(a >= 0, a + k, a)

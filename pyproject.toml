@@ -3,7 +3,16 @@ name = "llmc"
 version = "0.1.0"
 description = "Injecting gated code modules into small transformers"
 requires-python = ">=3.11"
-dependencies = ["torch>=2.5", "numpy", "matplotlib"]
+dependencies = [
+    "torch>=2.5",
+    "numpy",
+    "matplotlib",
+    "transformers>=5.23.0",
+    "pydivsufsort>=0.0.20",
+    "huggingface-hub>=2.4.0",
+    "datasets>=5.2.0",
+    "zstandard>=0.25.0",
+]
 
 [build-system]
 requires = ["hatchling"]

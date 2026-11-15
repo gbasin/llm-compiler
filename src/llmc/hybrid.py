@@ -120,8 +120,21 @@ class Hybrid(nn.Module):
         self.domains: dict[str, int] = {"tok": vocab}
         self.readers = nn.ModuleList()
         self.decoders = nn.ModuleList()
+        self.logit_slots = nn.ModuleList()  # code-emitted token ids -> logit bias
         self.table = None  # optional code that emits next-token log-probs (e.g. NGramTable)
         self.bias_gate = None
+
+    def add_logit_slot(self, slot):
+        """logits[v] += softplus(r . LN(h) + b) * beta  where v = slot value (if valid).
+        beta starts at 0 but gets gradient immediately (the one-hot is fixed)."""
+        g = nn.Module()
+        g.slot = slot
+        g.gate = nn.Sequential(nn.LayerNorm(self.d), nn.Linear(self.d, 1))
+        nn.init.zeros_(g.gate[1].weight)
+        nn.init.zeros_(g.gate[1].bias)
+        g.beta = nn.Parameter(torch.zeros(()))
+        self.logit_slots.append(g.to(self.tok_emb.weight.device))
+        return g
 
     def add_logit_table(self, table):
         """Add code-computed log p(next) to the output logits, weighted per position by
@@ -160,7 +173,7 @@ class Hybrid(nn.Module):
         return dec
 
     def param_counts(self):
-        ifc = ("readers", "decoders", "bias_gate")
+        ifc = ("readers", "decoders", "bias_gate", "logit_slots")
         core = sum(p.numel() for n, p in self.named_parameters() if not n.startswith(ifc))
         iface = sum(p.numel() for n, p in self.named_parameters() if n.startswith(ifc))
         code = dict(ops=len(self.ops),
@@ -206,6 +219,11 @@ class Hybrid(nn.Module):
             if i < self.n_layers:
                 x = self.blocks[i](x)
         logits = self.head(self.ln_f(x))
+        for g in self.logit_slots:
+            v = regs[g.slot]
+            ok = (v >= 0) & (v < logits.shape[-1])
+            oh = F.one_hot(v.clamp(0, logits.shape[-1] - 1), logits.shape[-1]).to(logits.dtype) * ok[..., None]
+            logits = logits + F.softplus(g.gate(x)) * g.beta * oh
         if self.table is not None:
             lp = self.table.logprobs(tokens, targets).to(logits.device)
             logits = logits + F.softplus(self.bias_gate(x)) * lp
