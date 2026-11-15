@@ -340,3 +340,87 @@ Loss saved vs. effort: one iteration ($0.47) captured 0.75 of the 0.78 nats gain
 iterations added 0.025. The agent beat my hand-built table + net (1.64) but never tried in-context
 copying. Caveat: by iter 6 the "table" contains fitted blend weights, i.e. some learned parameters now
 live in code and are not counted as core.
+
+---
+# M6 — when and where to insert code (follow-up to doubleAI's "Can LLMs redesign themselves as they train?")
+
+doubleAI insert code mid-training, after errors plateau, choosing *what* from clustered "phantom
+gradients" (dL/dh) and *where* from the layer where that gradient peaks. Their timing result: an
+exact-match lookup inserted at step 1,200 gives better beyond-window recall than one present from step 0
+(72% vs 55%), which they attribute to shortcut learning. Two questions for us: does that replicate at our
+scale, and can we choose code far earlier (greedily) without losing anything?
+
+### 1. Lookup timing replication (`llmc/early.py`, `runs/early/`, 3 seeds, 4000 steps)
+Char-level Tiny Shakespeare, T=256, attention limited to the last 16 chars. Lookup = parameter-free code:
+the char after the latest earlier match of the last 4 chars, fed to every head as an extra key/value
+through a zero-init gate. "Far copy" = tokens whose lookup match is ≥16 back and correct (5.2% of tokens,
+unreachable by windowed attention). Val nats/char:
+
+| core | arm | all tokens | far copy | near copy | other tokens |
+|---|---|---|---|---|---|
+| 1×2×32 (16.7k) | no lookup | 2.068 ± .006 | 1.770 | 1.666 | **2.086** |
+| | full attention, no window | 2.237 ± .018 | 1.989 | 1.882 | 2.252 |
+| | lookup inserted at step 1200 | 2.047 ± .006 | 1.140 | 1.199 | 2.100 |
+| | lookup from step 0 | **2.036 ± .019** | **0.602** | **0.846** | 2.119 |
+| 2×4×64 (29.2k) | no lookup | 1.913 ± .026 | 1.651 | 1.443 | **1.929** |
+| | full attention, no window | 2.022 ± .014 | 1.731 | 1.554 | 2.040 |
+| | lookup inserted at step 1200 | 1.878 ± .024 | 0.693 | 0.796 | 1.947 |
+| | lookup from step 0 | **1.862 ± .009** | **0.531** | **0.784** | 1.939 |
+
+- **doubleAI's late-insertion advantage did not replicate here.** Lookup from step 0 is at least as good
+  overall and much better on the copy tokens it exists for (0.60 vs 1.14 for the small core).
+- **The shortcut effect is real but small:** with the lookup the network does slightly worse on
+  everything else (+0.01 to +0.03), more so when present from the start. It's a trade, not a loss.
+- Tiny cores trained worse with full attention than with the window in 4000 steps (learned absolute
+  positions over 256 slots).
+- Caveats: char-level, 4000 steps, a sigmoid side channel instead of joining the softmax, ~1000× smaller
+  than their models.
+
+### 2. Choosing code early: cheap scores vs the real gain (`llmc/greedy.py validate`)
+Fixed 2×2×64 core (d=32, our NoPE Hybrid). 12 candidate code features on the raw text: k-gram lookups
+(k = 1, 2, 3, 4, 6, 8), match length, chars since newline/space, char class, previous 1/2/3 chars. Each
+can be read at site 0 or 2 through a zero-init lookup table. At steps 50, 500, 3000 of a no-code run,
+three scores per (candidate, site):
+- **grad**: energy of the zero-init table's centred gradient. One backward pass scores everything.
+- **fit**: held-out loss drop from training only that table for 150 steps on the frozen model.
+- **trial** (ground truth): insert it, train the whole model 500 steps, compare with a no-insert control.
+
+| step | Spearman grad~trial | Spearman fit~trial | top by trial | top by fit |
+|---|---|---|---|---|
+| 50 | 0.66 | 0.82 | prev char @0 | prev char @0 |
+| 500 | 0.68 | 0.93 | prev char @0 | prev char @0 |
+| 3000 | 0.64 | 0.93 | prev char @0 | prev char @0 |
+
+The top six by real gain are in the same order at all three checkpoints. **What to insert, and where, is
+already decidable at step 50:** there was nothing to wait for. The frozen-model fit is the reliable score;
+the one-pass gradient score is a usable pre-filter but over-rates "chars since space".
+
+### 3. Greedy vs late vs all-at-once (`llmc/greedy.py run`, `runs/greedy/`, 3 seeds, 6000 steps)
+- **greedy**: from step 0, every 250 steps, gradient-score everything, fit-score the top 3, insert the
+  best if it gains > 0.005 (max 6 insertions).
+- **late**: the same procedure starting at step 3000, standing in for doubleAI's timing.
+- **all**: all 12 candidates at site 0 from step 0.
+
+| arm | val @1000 | @3000 | final @6000 | mean over training | interface params |
+|---|---|---|---|---|---|
+| no code | 2.347 | 2.287 | 2.224 ± .028 | 2.375 | 0 |
+| late (from 3000) | 2.347 | 2.287 | 1.849 ± .008 | 2.215 | ~9.6k |
+| **greedy (from 0)** | 1.954 | **1.848** | 1.815 ± .003 | 1.989 | ~8k |
+| all at once | **1.892** | 1.828 | **1.801 ± .005** | **1.945** | 21.7k |
+
+- **Greedy reaches late's final loss by step 3000, half the training,** and still ends better
+  (1.815 vs 1.849). Both pick nearly the same features (previous 1–3 chars, chars since space, char
+  class), consistent with the stable rankings above. Selection cost ~50 s per run, about 25% overhead.
+- **All-at-once** is slightly better again (−0.014) but uses 2.7× the interface params of greedy, more
+  than the 17k core itself. Greedy gets ~97% of the gain with ~37% of the lookup-table parameters.
+- **Caveat on what was picked:** this core has no positional encoding, so previous-char features
+  (position information it can't easily build) dominate. Copy features rarely won at T=64.
+
+### 4. Gradient-peak placement on M1 (inconclusive)
+On the M1 sum-mod-5 baseline, raw, target-centred and |h|-scaled phantom gradients all peak at site 0.
+Injecting the same module with probe/unembed interfaces at write site 0, 1 or 2 reaches 100% from all
+three (2 seeds; site 0 was slower in one). A 2-layer task can't tell placement rules apart.
+
+**Takeaway:** at small scale, insert early. The same choices are visible after ~50 steps, early insertion
+learns faster and ends better, and the shortcut cost is small. If shortcut learning is the worry, the
+smallest fix is a tiny "other tokens" penalty check, not a 1000-step wait.
