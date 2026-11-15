@@ -118,6 +118,7 @@ def main():
     ap.add_argument("--mlp", type=int, default=128)
     ap.add_argument("--n", type=int, default=12)
     ap.add_argument("--k_train", type=int, default=6)
+    ap.add_argument("--curriculum", action="store_true", help="start at 1 hop, add a hop when train acc > 0.9")
     ap.add_argument("--step_emb", action="store_true")
     ap.add_argument("--no_inject", action="store_true")
     ap.add_argument("--steps", type=int, default=20000)
@@ -140,20 +141,26 @@ def main():
     t0 = time.time()
     ks = list(range(1, 13))
     Ts = [1, 2, 4, 6, 8, 12, 16, 24] if a.arm == "looped" else [1]
+    kcur, accs = (1 if a.curriculum else a.k_train), []
     for step in range(a.steps + 1):
         if step % 2000 == 0 or step == a.steps:
             grid = eval_grid(model, task, Ts, ks)
             T_main = a.tmax if a.arm == "looped" else 1
-            rec = dict(step=step, arm=a.arm, blocks=a.blocks, core=model.core_params(), time=round(time.time() - t0),
+            rec = dict(step=step, kcur=kcur, arm=a.arm, blocks=a.blocks, core=model.core_params(), time=round(time.time() - t0),
                        acc_by_k={k: round(grid[(k, T_main)], 3) for k in ks},
                        grid={f"k{k}_T{T}": round(v, 3) for (k, T), v in grid.items()})
             f.write(json.dumps(rec) + "\n"); f.flush()
             print(json.dumps({x: rec[x] for x in ("step", "core", "time", "acc_by_k")}), flush=True)
         if step == a.steps:
             break
-        tok, y, k = task.sample(a.bs, g, kmin=1, kmax=a.k_train)
+        tok, y, k = task.sample(a.bs, g, kmin=1, kmax=kcur)
         T = int(torch.randint(a.tmin, a.tmax + 1, (1,), generator=g)) if a.arm == "looped" else 1
-        loss = F.cross_entropy(model(tok, T=T), y)
+        lg = model(tok, T=T)
+        loss = F.cross_entropy(lg, y)
+        accs = (accs + [(lg.argmax(-1) == y).float().mean().item()])[-50:]
+        if a.curriculum and kcur < a.k_train and len(accs) == 50 and sum(accs) / 50 > 0.9:
+            kcur, accs = kcur + 1, []
+            print(f"step {step}: curriculum -> k <= {kcur}", flush=True)
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)

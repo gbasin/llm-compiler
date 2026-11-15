@@ -39,9 +39,10 @@ def expert_table(tok, n):
 
 
 class CallerCore(nn.Module):
-    def __init__(self, vocab, length, n, d=32, heads=1, mlp=64, step_emb=True, max_steps=64):
+    def __init__(self, vocab, length, n, d=32, heads=1, mlp=64, step_emb=True, max_steps=64, counter=False, hop_tok=None):
         super().__init__()
-        self.n = n
+        self.n, self.hop_tok = n, hop_tok
+        self.counter = nn.Embedding(3, d) if counter else None  # sensor: remaining hops (k - t) clipped to 0/1/2+
         self.emb = nn.Embedding(vocab, d)
         self.pos = nn.Parameter(torch.randn(length, d) * 0.02)
         self.block = GBlock(d, heads, max(d // max(heads, 1), 1), mlp)
@@ -56,11 +57,11 @@ class CallerCore(nn.Module):
 
     def core_params(self):
         """Core = block + injection + step emb. Lexicon (emb/pos/head) and ports (res_emb/query) excluded."""
-        skip = ("emb.", "pos", "head.", "ln.", "res_emb.", "query.")
+        skip = ("emb.", "pos", "head.", "ln.", "res_emb.", "query.", "counter.")
         return sum(p.numel() for n, p in self.named_parameters() if not n.startswith(skip))
 
     def port_params(self):
-        return sum(p.numel() for n, p in self.named_parameters() if n.startswith(("res_emb.", "query.")))
+        return sum(p.numel() for n, p in self.named_parameters() if n.startswith(("res_emb.", "query.", "counter.")))
 
     def forward(self, tok, T, mode="soft", use_expert=True, all_steps=False):
         B, L = tok.shape
@@ -73,6 +74,9 @@ class CallerCore(nn.Module):
         for t in range(T):
             r = torch.zeros_like(e0)
             r[:, -1] = reg
+            if self.counter is not None:
+                rem = ((tok == self.hop_tok).sum(1) - t).clamp(0, 2)
+                r[:, -1] = r[:, -1] + self.counter(rem)
             x = self.inject(torch.cat([x, e0, r], -1))
             if self.step is not None:
                 x = x + self.step[min(t, len(self.step) - 1)]
@@ -123,12 +127,15 @@ def main():
     ap.add_argument("--name", required=True)
     ap.add_argument("--query", choices=["labeled", "soft", "st", "none"], required=True)
     ap.add_argument("--d", type=int, default=32)
+    ap.add_argument("--counter", action="store_true", help="code sensor: remaining hops clipped to 0/1/2+")
+    ap.add_argument("--no_step", action="store_true")
     ap.add_argument("--heads", type=int, default=1)
     ap.add_argument("--mlp", type=int, default=64)
     ap.add_argument("--tmin", type=int, default=8)
     ap.add_argument("--tmax", type=int, default=12)
     ap.add_argument("--n", type=int, default=12)
     ap.add_argument("--k_train", type=int, default=6)
+    ap.add_argument("--curriculum", action="store_true", help="start at 1 hop, add a hop when train acc > 0.9")
     ap.add_argument("--steps", type=int, default=20000)
     ap.add_argument("--bs", type=int, default=128)
     ap.add_argument("--lr", type=float, default=1e-3)
@@ -139,7 +146,8 @@ def main():
     torch.manual_seed(a.seed)
     torch.set_num_threads(a.threads)
     task = PointerTask(a.n, kmax=12)
-    model = CallerCore(task.vocab, task.length, a.n, a.d, a.heads, a.mlp)
+    model = CallerCore(task.vocab, task.length, a.n, a.d, a.heads, a.mlp, step_emb=not a.no_step,
+                       counter=a.counter, hop_tok=task.HOP)
     use_expert = a.query != "none"
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=0.01)
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1, (s + 1) / 500))
@@ -149,20 +157,25 @@ def main():
     g = torch.Generator().manual_seed(a.seed)
     t0 = time.time()
     ks, Ts = list(range(1, 13)), [1, 2, 4, 6, 8, 12, 16, 24]
+    kcur, accs = (1 if a.curriculum else a.k_train), []
     for step in range(a.steps + 1):
         if step % 2000 == 0 or step == a.steps:
             grid = eval_grid(model, task, Ts, ks, a.query, use_expert)
-            rec = dict(step=step, query=a.query, core=model.core_params(), ports=model.port_params(),
+            rec = dict(step=step, kcur=kcur, query=a.query, core=model.core_params(), ports=model.port_params(),
                        time=round(time.time() - t0), acc_by_k={k: round(grid[(k, a.tmax)], 3) for k in ks},
                        grid={f"k{k}_T{T}": round(v, 3) for (k, T), v in grid.items()})
             f.write(json.dumps(rec) + "\n"); f.flush()
             print(json.dumps({x: rec[x] for x in ("step", "core", "ports", "time", "acc_by_k")}), flush=True)
         if step == a.steps:
             break
-        tok, y, k = task.sample(a.bs, g, kmin=1, kmax=a.k_train)
+        tok, y, k = task.sample(a.bs, g, kmin=1, kmax=kcur)
         T = int(torch.randint(a.tmin, a.tmax + 1, (1,), generator=g))
         logits, ql = model(tok, T=T, mode=a.query if use_expert else "soft", use_expert=use_expert)
         loss = F.cross_entropy(logits, y)
+        accs = (accs + [(logits.argmax(-1) == y).float().mean().item()])[-50:]
+        if a.curriculum and kcur < a.k_train and len(accs) == 50 and sum(accs) / 50 > 0.9:
+            kcur, accs = kcur + 1, []
+            print(f"step {step}: curriculum -> k <= {kcur}", flush=True)
         if a.query == "labeled":
             ch = chain(tok, a.n, T)
             for t, q in enumerate(ql):
