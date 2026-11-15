@@ -27,9 +27,11 @@ import torch.nn.functional as F
 from . import oplib
 
 TASK_V2 = False
+TASK_V3 = False
 HIDDEN = ["parse_num", "hold", "arith", "render", "since_char", "offset"]
 ARCH, D, HD = "2x4x64", 64, 16
-TRIAL_STEPS, EVAL_N = 1500, 200
+import os
+TRIAL_STEPS, EVAL_N = int(os.environ.get("TRIAL_STEPS", 1500)), 200
 
 OPS_TEMPLATE = '''"""Agent-written ops and contract label functions. Edit freely.
 
@@ -56,7 +58,11 @@ phrasing, optional distractor sentences that can contain numbers. Example:
 The model must generate the answer digits + newline after "A: ". Metric: greedy exact match on
 three splits (v2 if the workspace has a V2 marker file: distractor numbers can also appear
 INSIDE the operand sentence, e.g. "Tom has 5 bags in room 8 with 10 stones each.", or
-between the two operands): id (operands 0..20), distract (always a distractor sentence), big (operands 0..50,
+between the two operands; v3 if the workspace has a V3 marker: the question is always the neutral
+"Q: how many <obj>?", so the operation must be inferred from the story; the score also reports a
+"novel" split with SECRET held-out phrasings/verbs/distractors (stored outside the repo; you cannot
+see them) -- it is NOT part of the score, but it measures whether your solution generalizes, so
+prefer general solutions over memorizing template wording): id (operands 0..20), distract (always a distractor sentence), big (operands 0..50,
 written as digits above 20). Score = mean of the three.
 
 ## Model: tiny transformer core, default arch 2 layers x 4 heads x 64 MLP, d=64 (~57k core params).
@@ -158,6 +164,9 @@ def evaluate(model, wm, n=EVAL_N):
         _, _, probs = wm.batch(n, random.Random(123), **kw)
         out[name] = round(wm.exact_match(model, probs), 4)
     out["score"] = round(sum(out.values()) / 3, 4)
+    # held-out paraphrases (never trained on, not part of the score)
+    _, _, probs = wm.batch(n, random.Random(321), novel=True)
+    out["novel"] = round(wm.exact_match(model, probs), 4)
     return out
 
 
@@ -184,7 +193,7 @@ def trial(ws: Path, steps=TRIAL_STEPS, seed=0):
 
     torch.manual_seed(seed)
     torch.set_num_threads(4)
-    wm = WordMath(v2=TASK_V2)
+    wm = WordMath(v2=TASK_V2, v3=TASK_V3)
     mod = load_agent_module(ws)
     model, plan = build(ws, wm, mod)
     opt = torch.optim.AdamW(model.parameters(), lr=2e-3, weight_decay=0.01)
@@ -211,7 +220,7 @@ def check(ws: Path):
     """Agent-facing validation: build, forward one batch, show slots for one example."""
     from .wordmath import WordMath
 
-    wm = WordMath(v2=TASK_V2)
+    wm = WordMath(v2=TASK_V2, v3=TASK_V3)
     mod = load_agent_module(ws)
     model, plan = build(ws, wm, mod)
     tokens, targets, probs = wm.batch(8, random.Random(1))
@@ -264,7 +273,9 @@ def run(ws: Path, iters: int, model_name: str | None):
                "--permission-mode", "acceptEdits"]
         if model_name:
             cmd += ["--model", model_name]
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+        import os
+        env = {k: v for k, v in os.environ.items() if k != "WM_HELDOUT"}  # never expose the secret set
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800, env=env)
         agent_time = round(time.time() - t0, 1)
         try:
             out = json.loads(proc.stdout)
@@ -307,10 +318,16 @@ def main():
     ap.add_argument("--iters", type=int, default=6)
     ap.add_argument("--model")
     ap.add_argument("--v2", action="store_true")
+    ap.add_argument("--v3", action="store_true")
     a = ap.parse_args()
     ws = Path(a.ws)
     global TASK_V2
-    TASK_V2 = a.v2 or (ws / "V2").exists()
+    global TASK_V3
+    TASK_V3 = a.v3 or (ws / "V3").exists()
+    TASK_V2 = a.v2 or (ws / "V2").exists() or TASK_V3
+    if a.v3:
+        ws.mkdir(parents=True, exist_ok=True)
+        (ws / "V3").touch()
     if a.v2:
         ws.mkdir(parents=True, exist_ok=True)
         (ws / "V2").touch()

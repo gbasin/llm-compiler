@@ -114,7 +114,7 @@ def main():
             for s in seqs:
                 x = torch.tensor(s[None], device=dev)
                 lp = F.log_softmax(model(x).logits[0, :-1].float(), -1)
-                p_model.append(lp.gather(1, x[0, 1:, None])[:, 0].double().cpu().numpy())
+                p_model.append(lp.gather(1, x[0, 1:, None])[:, 0].cpu().double().numpy())
                 top_model.append(lp.argmax(-1).cpu().numpy())
         lpm = np.concatenate(p_model)  # log p_model(y)
         pm = np.exp(lpm)

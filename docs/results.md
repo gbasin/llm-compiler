@@ -210,3 +210,112 @@ Table alone (no network): val 1.686 (K=2: 2.054, K=3: 1.785, K=5: 1.713, K=6: 1.
   what's left beyond 4-gram statistics is slow for tiny nets to learn. Train/val gaps match with or
   without the table (0.24 vs 0.22), so LOO works; the val split (end of the play) is simply harder.
 - Suffix-match code still adds a little on top of the table (in-context copying of names etc.).
+
+---
+# M5 — going deeper: how much of a real model is procedure-able, and can an agent find it?
+
+## Direction 1 — procedure-able share of real LMs (inference only)
+Code predictor = local **infini-gram**: next-token counts after the longest context match in the
+model's training corpus (suffix array over the reversed corpus, `audit/infinigram.py`, verified
+against brute force). Compared per token with the model; plus a learned per-token mixture
+(weights from match length, count, confidences) fit on half the eval docs, scored on the other half.
+`scripts/audit.py`.
+
+### TinyStories-1M…33M, index = the **full** 464M-token training corpus (400 held-out stories, 79k tokens)
+| model | params (incl. emb) | model loss | top-1 model / code | tokens code ≥ model | held-out mixture loss gain |
+|---|---|---|---|---|---|
+| 1M | 3.7M | 1.94 | 0.55 / 0.61 | 44% | **20.5%** |
+| 3M | 8.3M | 1.50 | 0.63 / 0.61 | 33% | 16.8% |
+| 8M | 19.7M | 1.19 | 0.69 / 0.61 | 27% | 14.3% |
+| 28M | 52M | 1.01 | 0.73 / 0.61 | 22% | 13.6% |
+| 33M | 69M | 1.01 | 0.72 / 0.61 | 21% | 12.8% |
+
+The externalizable share shrinks with model size but flattens near ~13% of loss. Caveat: 18.6% of
+eval tokens have ≥32-token matches in the training set (code 99% right there) — TinyStories is
+highly repetitive, so a good part of this share is near-duplicate memorization moved into a table.
+
+### Pythia-70M…1B, index = a Pile **sample** (monology/pile-uncopyrighted shard 00; 300 val docs)
+| index | code top-1 | mix gain 70M | 160M | 410M | 1B |
+|---|---|---|---|---|---|
+| 10M tok | 0.195 | 0.0% | 0.1% | 0.0% | 0.0% |
+| 30M tok | 0.217 | 0.25% | 0.12% | 0.0% | 0.0% |
+| 100M tok (0.03% of Pile) | 0.244 | 0.49% | 0.20% | 0.0% | 0.0% |
+(model top-1: 0.44 / 0.50 / 0.54 / 0.56.) Gain grows with index coverage and shrinks with model
+size; with ≤0.03% of the training data indexed, code adds nothing for ≥410M. Full-Pile coverage
+isn't feasible locally, so this is only a lower bound. In-context copying alone (no corpus) is right
+on 11% of TinyStories tokens.
+
+## Direction 2 — decompile attention heads into library programs
+Programs: prev, prev2, self, bos, induction (=`prev_occ_next`), dup, punct, uniform. Per head: best
+program by pattern match (1 − TV), loss change when its pattern is *replaced* by the program
+(value/output weights kept) vs *mean-ablated*. Custom HF attention hook (`scripts/decompile_heads.py`),
+own-model hook (`scripts/decompile_own.py`).
+
+| model | heads | match ≥0.5 | replace matched / ablate matched | replace ALL / ablate ALL | median match |
+|---|---|---|---|---|---|
+| Pythia-70M | 48 | 2 (prev, uniform) | +0.057 / +0.280 | +2.48 / +4.06 | 0.25 |
+| Pythia-160M | 144 | 9 (self 4, prev 3, uniform 2) | +0.098 / +0.306 | +2.96 / +4.40 | 0.24 |
+| own char model (4×4, NoPE, Shakespeare) | 16 | 5 (all uniform) | +0.61 / +1.67 | +2.24 / +1.81 | – |
+
+Only 4–6% of Pythia heads closely match a fixed primitive; where they do, code recovers ~70–80% of
+the head's contribution. Replacing every head with its best program recovers only ~33–39% of
+attention's total contribution — real heads are mostly fuzzy/contextual, not our clean primitives
+(no clean induction or BOS heads under these strict templates). Our NoPE char model uses uniform
+averaging heads (its only way to sense position); replacing all its heads is worse than ablating.
+
+## Direction 4 — messy language in, exact computation out (`wordmath.py`, `wm_train.py`)
+Char-level word problems: operands as digits/words/"a dozen", varied templates, distractor numbers.
+Splits: id (operands ≤20), distract (always a distractor), big (operands ≤50), plus held-out paraphrases.
+Hybrid ops: `parse_num`, `hold`, `arith`, `render`, `since_char`, and a new **logit slot**
+(code emits a char id → gated, learned-strength logit bias).
+
+| model (v1 task, 4000 steps) | id | distract | big |
+|---|---|---|---|
+| pure 2×4×128 | 0.52 | 0.50 | 0.09 |
+| pure 4×4×256 | 0.89 | 0.86 | 0.17 |
+| my hand-designed hybrid (role contract on every number) | 0.68 | 0.64 | 0.37 |
+| agent's discovered hybrid (wm1, 1500 steps) | **1.00** | **1.00** | **1.00** |
+
+My interface was worse than the agent's: labelling the role of every number at every position let
+mislabelled answer digits feed back into the computation.
+
+## Direction 3 — automated discovery (headless Claude Code agents, `discover.py`, `discover_lm.py`)
+Each iteration: `claude -p` reads diagnostics, writes ops/labels/plan in a workspace, self-checks;
+the harness trains a trial and keeps the change only if it improves (score, then smaller core).
+The agent starts *without* my task-specific ops.
+
+### Word problems
+| run | what the agent did | score | core params | secret held-out | agent cost |
+|---|---|---|---|---|---|
+| wm1 (v1) | iter 1: code parses mentions, computes, emits; network decides op + "distractor first?" | 0.098 → **1.00** | 57k | (repo paraphrases 0.885) | $0.66 (+$1.14 wasted no-op iters) |
+| wm2 (v2 + core objective) | iter 2: **removed all transformer layers**; keyword rules for roles/op | 1.00 | **7.4k** | – | $1.30 |
+| wm3 (v3: neutral question) | all-code rules; **read the held-out templates from the repo and copied cue words** (disclosed) | 1.00 | 7.6k | 0.63 (repo set: 1.0, contaminated) | $0.63 |
+| wm4 | secret set leaked via inherited env var (disclosed) | 1.00 | 7.6k | 0.775 (contaminated) | $0.78 |
+| **wm5 (clean)** | all-code: multiply/remove-verb lexicons, default add, only operand sentences | **1.00** | 7.6k | **0.825** | $0.72 |
+| pure 4×4×256 (v3, 4000 steps) | – | 0.58 | 206k | **0.035** | – |
+| pure 2×4×64 (v3) | – | 0.07 | 57k | 0.025 | – |
+
+Findings:
+- On a finite template grammar the agent externalizes **everything**, including the "soft" parsing,
+  and deletes the network. It also exploits generator artifacts (op readable from the question
+  wording; distractor position), which is why v3/neutral questions and a secret held-out set were needed.
+- On truly unseen phrasings the agent's code generalizes far better than trained networks
+  (0.825 vs 0.035): the code carries the agent's own world knowledge (which verbs mean removal),
+  which a small net trained only on the generator cannot have.
+- Two evaluation leaks happened (repo-readable templates; inherited env var). Both were caught because
+  the agent disclosed them; the harness now strips the secret from the agent's environment.
+- The keep rule needs a non-saturating objective; once score hit 1.0 most iterations were no-ops.
+
+### Tiny Shakespeare (`discover_lm.py`; fixed 17k-param core, 4000 steps; n-gram/suffix code hidden)
+| iter | agent change | val loss | cumulative agent cost |
+|---|---|---|---|
+| 0 | no code | 2.276 | – |
+| 1 | **rediscovered a corpus n-gram table** (order 8, Witten-Bell) **with leave-one-out** | 1.523 | $0.47 |
+| 2–4 | smoothing variants (KN worse), table-confidence op, cross-fold LOO | rejected (<0.005 gain) | $1.99 |
+| 5 | blend weights fit on held-out training text to mimic val shift | 1.506 | $2.54 |
+| 6 | mixer over several smoothings per context depth | **1.498** | $3.16 |
+
+Loss saved vs. effort: one iteration ($0.47) captured 0.75 of the 0.78 nats gained; the next five
+iterations added 0.025. The agent beat my hand-built table + net (1.64) but never tried in-context
+copying. Caveat: by iter 6 the "table" contains fitted blend weights, i.e. some learned parameters now
+live in code and are not counted as core.

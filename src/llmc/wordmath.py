@@ -44,6 +44,25 @@ TEMPLATES_V2 = {
             "There are {a} rows of {b} {o} on shelf {d}.",
             "On day {d} {N} buys {a} packs of {o}. Each pack has {b}."],
 }
+# held-out paraphrases: never used in training, only for the "novel" eval split
+TEMPLATES_NOVEL = {
+    "add": ["{N} owns {a} {o}. Later {P} gets {b} extra.", "{N} picked {a} {o}, then {b} more were added.",
+            "A shop gave {N} {b} {o}. {P} already had {a}."],
+    "sub": ["{N} owns {a} {o}. Later {P} drops {b}.", "{N} picked {a} {o}, then {b} were eaten.",
+            "Of the {a} {o}, {N} sold {b}."],
+    "mul": ["{N} fills {a} jars, putting {b} {o} in each.", "Each of the {a} kids has {b} {o}.",
+            "{N} makes {a} piles of {o}, {b} per pile."],
+}
+NOVEL_DISTRACT = ["The bus has {d} wheels.", "{P} counted to {d} once.", "It rained for {d} days."]
+# optional secret held-out set loaded from outside the repo (WM_HELDOUT=path.json), replaces the
+# novel templates/distractors when set; the chars must already be in the vocabulary.
+import json as _json
+import os as _os
+if _os.environ.get("WM_HELDOUT"):
+    _ho = _json.load(open(_os.environ["WM_HELDOUT"]))
+    _HO_T, _HO_D = _ho["templates"], _ho["distract"]
+else:
+    _HO_T = _HO_D = None
 QUESTIONS = {"add": "Q: how many {o} now?", "sub": "Q: how many {o} are left?", "mul": "Q: how many {o} in total?"}
 DISTRACT = ["It is {d} o'clock.", "{P} is {d} years old.", "The sky is blue.", "{P} likes cats.", ""]
 
@@ -68,7 +87,8 @@ class Problem:
     spans: list  # (start, end, value, role) role in {"a", "b", "distractor"}
 
 
-def make_problem(rng: random.Random, max_n: int = 20, p_distract: float = 0.6, v2: bool = False) -> Problem:
+def make_problem(rng: random.Random, max_n: int = 20, p_distract: float = 0.6, v2: bool = False,
+                 novel: bool = False, v3: bool = False) -> Problem:
     op = rng.choice(OPS)
     a, b = rng.randint(0, max_n), rng.randint(0, max_n)
     if op == "sub" and b > a:
@@ -81,6 +101,8 @@ def make_problem(rng: random.Random, max_n: int = 20, p_distract: float = 0.6, v
     spans = []
     if v2 and rng.random() < 0.5:
         tmpl = rng.choice(TEMPLATES_V2[op])
+    if novel:
+        tmpl = rng.choice((_HO_T or TEMPLATES_NOVEL)[op])
     d_in = rng.randint(1, 12)
     fills = {"a": (sa, a, "a"), "b": (sb, b, "b"), "d": (say(d_in, rng), d_in, "distractor")}
     body = tmpl.format(N=N, P=P, o=o, a="\0a", b="\0b", d="\0d")
@@ -96,7 +118,7 @@ def make_problem(rng: random.Random, max_n: int = 20, p_distract: float = 0.6, v
             i += 1
     pre, post, dspan = "", "", None
     if rng.random() < p_distract:
-        dt = rng.choice(DISTRACT)
+        dt = rng.choice((_HO_D or NOVEL_DISTRACT) if novel and v3 else DISTRACT)
         d = rng.randint(1, 12)
         dsurf = say(d, rng)
         ds = dt.format(d=dsurf, P=P)
@@ -117,7 +139,7 @@ def make_problem(rng: random.Random, max_n: int = 20, p_distract: float = 0.6, v
         spans.append((dspan[0] + (0 if pre else shift), dspan[1] + (0 if pre else shift), dspan[2], dspan[3]))
     sent = pre + sent + post
     pre = ""
-    q = QUESTIONS[op].format(o=o)
+    q = ("Q: how many {o}?" if v3 else QUESTIONS[op]).format(o=o)
     prompt = sent + " " + q + " A: "
     text = prompt + str(ans) + "\n"
     for s0, e0, v, r in spans:
@@ -126,10 +148,10 @@ def make_problem(rng: random.Random, max_n: int = 20, p_distract: float = 0.6, v
 
 
 class WordMath:
-    def __init__(self, max_n: int = 20, p_distract: float = 0.6, v2: bool = False):
-        self.v2 = v2
+    def __init__(self, max_n: int = 20, p_distract: float = 0.6, v2: bool = False, v3: bool = False):
+        self.v2, self.v3 = v2 or v3, v3
         chars = sorted(set("".join(WORDS + NAMES + OBJS) + "".join(sum(TEMPLATES.values(), []))
-                           + "".join(QUESTIONS.values()) + "".join(sum(TEMPLATES_V2.values(), [])) + "".join(DISTRACT) + "0123456789 .:'?\nQAHSTI{}abcdefghijklmnopqrstuvwxyz"))
+                           + "".join(QUESTIONS.values()) + "".join(sum(TEMPLATES_V2.values(), [])) + "".join(sum(TEMPLATES_NOVEL.values(), [])) + "".join(NOVEL_DISTRACT) + "".join(DISTRACT) + "0123456789 .:'?\nQAHSTI{}abcdefghijklmnopqrstuvwxyz"))
         chars = [c for c in chars if c not in "{}"]
         self.itos = chars
         self.stoi = {c: i for i, c in enumerate(chars)}
@@ -141,7 +163,8 @@ class WordMath:
         return [self.stoi[c] for c in s]
 
     def batch(self, B: int, rng: random.Random, **kw):
-        probs = [make_problem(rng, kw.get("max_n", self.max_n), kw.get("p_distract", self.p_distract), self.v2)
+        probs = [make_problem(rng, kw.get("max_n", self.max_n), kw.get("p_distract", self.p_distract), self.v2,
+                              kw.get("novel", False), self.v3)
                  for _ in range(B)]
         T = max(len(p.text) for p in probs)
         tokens = torch.full((B, T), self.PAD, dtype=torch.long)
