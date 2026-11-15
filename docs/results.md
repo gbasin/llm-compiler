@@ -210,6 +210,27 @@ Table alone (no network): val 1.686 (K=2: 2.054, K=3: 1.785, K=5: 1.713, K=6: 1.
   what's left beyond 4-gram statistics is slow for tiny nets to learn. Train/val gaps match with or
   without the table (0.24 vs 0.22), so LOO works; the val split (end of the play) is simply harder.
 - Suffix-match code still adds a little on top of the table (in-context copying of names etc.).
+  **Not supported at 3 seeds — see hygiene below.**
+
+### Hygiene — 3 seeds, 30k steps (3× the M4b budget), fixed cores, no growth (`scripts/hygiene_m4.sh`)
+Tiny Shakespeare, d=32, n-gram table K=4 with LOO, suffix = `suffix_next`+`suffix_len` readers at site 0.
+Val nats/char, mean ± sd over seeds 0–2 (`runs/m4h/`).
+
+| core | no code | + suffix | + n-gram table | + table + suffix |
+|---|---|---|---|---|
+| empty (4.4k) | – | – | **1.643 ± 0.001** | – |
+| 2×2×64 (17.0k) | 2.051 ± 0.021 | 1.940 ± 0.016 | 1.651 ± 0.008 | 1.645 ± 0.004 |
+| 4×4×128 (54.5k) | 1.749 ± 0.012 | – | 1.659 ± 0.012 | – |
+
+What holds and what doesn't:
+- **Holds:** table + 4.4k core beats the 12× larger no-table network even at convergence-length training
+  (1.643 vs 1.749, ~9 sd). The margin shrank from 0.15 (10k steps) to 0.11 because the big net kept learning.
+- **Holds, stronger:** with the table, extra core capacity buys nothing in 30k steps (1.643 → 1.651 → 1.659,
+  slightly *worse* with size). The leftover beyond 4-gram statistics is not reachable by these cores at this
+  budget.
+- **Holds:** suffix code on a fixed 17k core: 2.051 → 1.940 (−0.11, ~6 sd).
+- **Doesn't hold:** suffix on top of the table (1.651 → 1.645) is within seed noise. The table subsumes
+  most of what the suffix op provides at char level.
 
 ---
 # M5 — going deeper: how much of a real model is procedure-able, and can an agent find it?
