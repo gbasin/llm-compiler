@@ -28,8 +28,8 @@ from .ladder import apply_plan, parse_arch
 from .lmdata import CharSource, HMMSource
 
 
-def lm_loss(model, x):
-    logits = model(x[:, :-1])
+def lm_loss(model, x, loo=False):
+    logits = model(x[:, :-1], targets=x[:, 1:] if loo else None)
     return F.cross_entropy(logits.flatten(0, 1), x[:, 1:].flatten())
 
 
@@ -69,7 +69,7 @@ def train_steps(model, opt, src, n, args, seed):
     g = torch.Generator().manual_seed(seed)
     for _ in range(n):
         x = src.sample(args.batch_size, args.seq_len + 1, g)
-        loss = lm_loss(model, x)
+        loss = lm_loss(model, x, loo=True)
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -85,6 +85,7 @@ def main():
     ap.add_argument("--d", type=int, default=16)
     ap.add_argument("--head_dim", type=int, default=8)
     ap.add_argument("--plan", default="")
+    ap.add_argument("--ngram", type=int, default=0, help="add corpus n-gram logit table of this order")
     ap.add_argument("--seq_len", type=int, default=64)
     ap.add_argument("--batch_size", type=int, default=64)
     ap.add_argument("--lr", type=float, default=3e-3)
@@ -114,6 +115,10 @@ def main():
     model = Hybrid(src.vocab, args.d, parse_arch(args.arch), args.head_dim, V=src.vocab)
     log_plan = []
     apply_plan(model, json.loads(args.plan) if args.plan else [], log_plan)
+    if args.ngram:
+        from .ngram import NGramTable
+        model.add_logit_table(NGramTable(src.train, src.vocab, args.ngram))
+        log_plan.append(dict(ngram=args.ngram))
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
 
     out = Path(args.out_dir) / args.name

@@ -120,6 +120,16 @@ class Hybrid(nn.Module):
         self.domains: dict[str, int] = {"tok": vocab}
         self.readers = nn.ModuleList()
         self.decoders = nn.ModuleList()
+        self.table = None  # optional code that emits next-token log-probs (e.g. NGramTable)
+        self.bias_gate = None
+
+    def add_logit_table(self, table):
+        """Add code-computed log p(next) to the output logits, weighted per position by
+        softplus(r . LN(h) + b), initialized to weight 1 (trust the table)."""
+        self.table = table
+        self.bias_gate = nn.Sequential(nn.LayerNorm(self.d), nn.Linear(self.d, 1)).to(self.tok_emb.weight.device)
+        nn.init.zeros_(self.bias_gate[1].weight)
+        nn.init.constant_(self.bias_gate[1].bias, math.log(math.e - 1))
 
     # ------------------------------------------------------------ structure
     @property
@@ -150,9 +160,9 @@ class Hybrid(nn.Module):
         return dec
 
     def param_counts(self):
-        core = sum(p.numel() for n, p in self.named_parameters()
-                   if not n.startswith(("readers", "decoders")))
-        iface = sum(p.numel() for n, p in self.named_parameters() if n.startswith(("readers", "decoders")))
+        ifc = ("readers", "decoders", "bias_gate")
+        core = sum(p.numel() for n, p in self.named_parameters() if not n.startswith(ifc))
+        iface = sum(p.numel() for n, p in self.named_parameters() if n.startswith(ifc))
         code = dict(ops=len(self.ops),
                     table_entries=sum(len(o.kwargs.get("table", [])) for o in self.ops))
         return dict(core=core, interface=iface, **code)
@@ -170,7 +180,7 @@ class Hybrid(nn.Module):
                 ready_site[op.out] = site
                 changed = True
 
-    def forward(self, tokens, capture=False):
+    def forward(self, tokens, capture=False, targets=None):
         x = self.tok_emb(tokens)
         regs = {"tok": tokens}
         ready = {"tok": 0}
@@ -196,5 +206,8 @@ class Hybrid(nn.Module):
             if i < self.n_layers:
                 x = self.blocks[i](x)
         logits = self.head(self.ln_f(x))
+        if self.table is not None:
+            lp = self.table.logprobs(tokens, targets).to(logits.device)
+            logits = logits + F.softplus(self.bias_gate(x)) * lp
         self.last = dict(regs=regs, dec_logits=dec_logits, resid=resid)
         return logits

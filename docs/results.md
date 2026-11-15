@@ -172,3 +172,41 @@ no-code run's final loss (2.07) at ~11.4k core, i.e. ~33% fewer core params for 
 includes ~4.4k params of embeddings/unembedding at vocab 65.) Growth stopped in both when no candidate
 beat the control — at this data/step scale the policy, not just capacity, limits further growth.
 The pure-Python suffix op makes training ~2.6× slower; worth vectorizing.
+
+## M4b — copy trust (`since` op) and corpus n-gram tables as code
+
+### Copy trust on HMM + copy spans (grown from empty, single seed)
+Added generic `since(tok, value=COPY)` (positions since the marker) as a third reader.
+
+| run | core | loss all | copy-span | copy-span where code is right | where code is wrong |
+|---|---|---|---|---|---|
+| no code | 4,776 | 1.871 | 2.094 | 1.811 | 2.534 |
+| suffix code | 4,200 | 1.821 | 1.672 | 1.029 | 2.671 |
+| suffix + since | 4,448 | 1.827 | **1.496** | **0.593** | 2.898 |
+
+Correction to M4: copy-span loss can't go to ~0 — the suffix-match op is right on only 61% of copy-span
+targets (the first copied tokens are ambiguous until the match is long). Where the code *is* right,
+`since` lets the network trust it much more (1.03 → 0.59), and it trusts it less where it's wrong.
+
+### Tiny Shakespeare with a corpus n-gram table (orders 0–4, Witten-Bell, built by counting train split)
+`ngram.py`; added to output logits with a learned per-position weight (init 1). Leave-one-out during
+training (subtract the current occurrence from the counts) so the network doesn't learn to over-trust a
+table that has memorized the training token.
+
+Table alone (no network): val 1.686 (K=2: 2.054, K=3: 1.785, K=5: 1.713, K=6: 1.787).
+
+| model (val nats/char) | no table | + n-gram table |
+|---|---|---|
+| empty core (4.4k, d=32) | – | 1.649 |
+| fixed 2×2×64 (17k), 10k steps | 2.157 | 1.639 |
+| fixed 4×4×128 (54.5k), 10k steps | 1.795 | 1.643 |
+| grown, no code (M4) | 2.073 @ 17.1k | – |
+| grown + suffix (M4) | 1.932 @ 16.6k | – |
+| grown + table | – | 1.649 @ 4.4k (no growth helped) |
+| grown + table + suffix | – | **1.636 @ 5.4k** (+1 head) |
+
+- The table + a 4.4k-param core beats a 12× larger network without it (1.649 vs 1.795).
+- With the table present, growth stops immediately and larger fixed cores barely help within 10k steps:
+  what's left beyond 4-gram statistics is slow for tiny nets to learn. Train/val gaps match with or
+  without the table (0.24 vs 0.22), so LOO works; the val split (end of the play) is simply harder.
+- Suffix-match code still adds a little on top of the table (in-context copying of names etc.).

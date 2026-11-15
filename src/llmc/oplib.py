@@ -134,13 +134,31 @@ def _suffix_match(tok, cap: int = 15):
     return best_next, best_len
 
 
+def _suffix_cached(m, tok):
+    c = getattr(m, "_suffix_cache", None)
+    if c is None or c[0] is not tok:
+        c = (tok, _suffix_match(tok))
+        m._suffix_cache = c
+    return c[1]
+
+
 @op(lambda m, s: m.domains[s.inputs[0]])
 def suffix_next(m, tok):
     """Continuation of the longest earlier match of the current suffix (generic copy/induction)."""
-    return _suffix_match(tok)[0]
+    return _suffix_cached(m, tok)[0]
 
 
 @op(lambda m, s: 16)
 def suffix_len(m, tok):
     """Length (capped at 15) of that longest earlier suffix match."""
-    return _suffix_match(tok)[1]
+    return _suffix_cached(m, tok)[1]
+
+
+@op(lambda m, s: 17)
+def since(m, tok, value: int, cap: int = 15):
+    """Positions since the last occurrence of token `value` (0 = here), cap+1 if none/far."""
+    B, T = tok.shape
+    idx = torch.arange(T, device=tok.device).expand(B, T)
+    last = torch.where(tok == value, idx, torch.full_like(idx, -10_000))
+    last = torch.cummax(last, 1).values
+    return (idx - last).clamp(max=cap + 1)
