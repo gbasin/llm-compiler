@@ -48,7 +48,7 @@ STOI = {c: i for i, c in enumerate(CHARS)}
 VOCAB = len(CHARS)
 CORES = [("2x2x64", 32), ("2x2x32", 32), ("1x2x32", 32), ("1x2x32", 16), ("1x1x16", 16), ("1x0x0", 16)]
 HD, SEQ, BS, STEPS = 8, 128, 32, 8000
-KEEP_MARGIN, SHRINK_TOL = 0.005, 0.01
+KEEP_MARGIN, CORPUS_MARGIN, SHRINK_TOL = 0.005, 0.015, 0.01
 MAX_READER_DOMAIN, MAX_INTERFACE = 128, 6000
 SEL_SEED, SEL_N, K = 4242, 96, 10  # per corpus selection rows
 
@@ -424,16 +424,22 @@ API = f"""
 ## Task
 Next-character prediction on THREE corpora at once: Shakespeare plays, simple children's stories
 (TinyStories), and Python standard-library source. 97 chars (newline, printable ASCII, '¤' = other).
-Score = mean val loss (nats/char) over the three after training a tiny transformer core from scratch
-for {STEPS} steps of batch {BS} x {SEQ} chars. Lower is better. A change is kept if it beats the best by
-{KEEP_MARGIN}.
+Score = val loss (nats/char) on each corpus after training a tiny transformer core from scratch
+for {STEPS} steps of batch {BS} x {SEQ} chars (lower is better). A change is KEPT if the mean over the
+three improves by > {KEEP_MARGIN}, OR one corpus improves by > {CORPUS_MARGIN} while no corpus gets
+worse by > {KEEP_MARGIN}.
 
 ## The point
-We want the smallest, most GENERAL neural network: capability should live in general-purpose
-algorithms you write, not in memorized statistics. After every iteration the harness tries the next
-smaller core ({' -> '.join(f'{a}/d{d}' for a, d in CORES)}; "LxHxM" = layers x heads x MLP width) and adopts it if loss
-worsens by <= {SHRINK_TOL}. Code that lets a smaller core match a bigger one is the best outcome.
-The core has NO positional encoding.
+We want the smallest neural network, with capability moved into code. Think of each op as a small
+SYMBOLIC EXPERT: exact, narrow, and cheap. It does NOT need to help everywhere: an expert that
+tracks some structure that only exists in one kind of text is welcome. The network does the
+soft part: deciding per position whether and how to use each expert (every reader has a learned
+per-position router gate) and everything fuzzy. Several specialists side by side are fine.
+"General" here means algorithmic (computed from the window by rules, so it would work on unseen text
+of that kind), not memorized statistics, and not necessarily useful on every corpus.
+After every iteration the harness tries the next smaller core ({' -> '.join(f'{a}/d{d}' for a, d in CORES)}; "LxHxM" = layers x heads x MLP
+width) and adopts it if mean loss worsens by <= {SHRINK_TOL}. Code that lets a smaller core match a bigger one
+is the best outcome. The core has NO positional encoding.
 
 ## Rules (enforced)
 - Write every op yourself in ops.py. There is no library: no pre-written ops are available, and
@@ -441,7 +447,7 @@ The core has NO positional encoding.
   collections, and `from llmc.oplib import op` only.
 - Ops see only their input slots (the current {SEQ}-char window). No file access, no corpus statistics,
   no embedded word lists or tables (literal collections > 64 items or strings > 120 chars are rejected).
-  Algorithms only: things that would work on any text.
+  Rules and procedures, not memorized knowledge.
 - Ops must be causal and reasonably fast (vectorized torch).
 - Plan actions (plan.json, a list), only these two:
     {{"op": NAME, "inputs": [slots], "out": slot, "kwargs": {{...}}}}  run your op -> new int slot
@@ -465,11 +471,22 @@ directory ({ws}).
 {state}
 ## Workflow
 1. Read clusters.md, report.md, history.json.
-2. Think about what general procedure (computable from the window alone) would resolve the biggest
-   clusters across corpora. Write it in ops.py, check it, score it, iterate. Try several ideas.
+2. Think about what exact procedure (computable from the window alone) would resolve a big cluster,
+   on whichever corpus it lives in. Write it in ops.py, check it, score it, iterate. Try several ideas.
 3. Put the best into plan.json (the full plan; the next trial trains from scratch) and run ./tool check.
 4. Stop and summarize in 3-4 sentences: what algorithms you wrote, why, and what scoring showed.
 """
+
+
+def improved(res, st):
+    """Mean gain > KEEP_MARGIN, or a specialist win: one corpus gains > CORPUS_MARGIN, none loses > KEEP_MARGIN."""
+    if res["val_loss"] < st["best"] - KEEP_MARGIN:
+        return True
+    bp = st.get("best_per")
+    if not bp:
+        return False
+    d = {c: res["per_corpus"][c] - bp[c] for c in CORPORA}
+    return min(d.values()) < -CORPUS_MARGIN and max(d.values()) <= KEEP_MARGIN
 
 
 def report(ws, res, hist):
@@ -523,7 +540,7 @@ cd {REPO} && exec uv run python -m llmc.discover_gen "$cmd" --ws {ws} ${{cand:+-
             f"transfer={res['transfer_pile']}")
         if ok:
             st["core_idx"] += 1
-            st["best"] = res["val_loss"]
+            st["best"], st["best_per"] = res["val_loss"], res["per_corpus"]
             torch.save(ck, ws / "ckpt.pt")
             diagnose(ws)
         save()
@@ -531,7 +548,7 @@ cd {REPO} && exec uv run python -m llmc.discover_gen "$cmd" --ws {ws} ${{cand:+-
     if not hist:
         res, ck = trial(ws, 0)
         torch.save(ck, ws / "ckpt.pt")
-        st["best"] = res["val_loss"]
+        st["best"], st["best_per"] = res["val_loss"], res["per_corpus"]
         hist.append(dict(iter=0, kind="agent", kept=True, summary="baseline: no code", **res))
         save(); report(ws, res, hist); diagnose(ws)
         log("baseline", json.dumps(res))
@@ -545,7 +562,7 @@ cd {REPO} && exec uv run python -m llmc.discover_gen "$cmd" --ws {ws} ${{cand:+-
         for f in ("ops.py", "plan.json"):
             shutil.copy(ws / f, ws / (f + ".prev"))
         core = CORES[st["core_idx"]]
-        state = (f"Iteration {it}. Best mean val loss so far: {st['best']:.4f} on core {core[0]} d={core[1]} "
+        state = (f"Iteration {it}. Best mean val loss so far: {st['best']:.4f} (per corpus {st.get('best_per')}) on core {core[0]} d={core[1]} "
                  f"(the next trial uses this core).")
         t0 = time.time()
         proc = subprocess.run(["claude", "-p", PROMPT.format(ws=ws, api=API, state=state), "--output-format", "json",
@@ -561,11 +578,11 @@ cd {REPO} && exec uv run python -m llmc.discover_gen "$cmd" --ws {ws} ${{cand:+-
             summary, cost, turns = (proc.stdout + proc.stderr)[-1200:], None, None
         try:
             res, ck = trial(ws, st["core_idx"])
-            ok = res["val_loss"] < st["best"] - KEEP_MARGIN
+            ok = improved(res, st)
         except Exception:
             res, ck, ok = dict(val_loss=99.0, error=traceback.format_exc()[-1500:]), None, False
         if ok:
-            st["best"] = res["val_loss"]
+            st["best"], st["best_per"] = res["val_loss"], res["per_corpus"]
             torch.save(ck, ws / "ckpt.pt")
             diagnose(ws)
         else:
