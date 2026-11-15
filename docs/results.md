@@ -424,3 +424,40 @@ three (2 seeds; site 0 was slower in one). A 2-layer task can't tell placement r
 **Takeaway:** at small scale, insert early. The same choices are visible after ~50 steps, early insertion
 learns faster and ends better, and the shortcut cost is small. If shortcut learning is the worry, the
 smallest fix is a tiny "other tokens" penalty check, not a 1000-step wait.
+
+## M7 — informed discovery: failure clusters + fast scoring (`llmc/discover_fast.py`)
+The earlier agent loop (`discover_lm`, run `shake1`) gave the agent only the score, so it was guessing.
+This version gives it what doubleAI used gradients for, plus a fast check:
+- **`diagnose`:** takes the hardest 20% of tokens of the current best model and clusters them by
+  [target-centred phantom gradient at every site, final hidden state] (k-means, K=10). For each cluster,
+  `clusters.md` lists its share, mean loss, demand per site, % seen in context, % predicted by a 4-gram,
+  chars since newline, top targets and 8 examples showing context, target and the model's top 3.
+- **`score`:** freezes the model, trains only the candidate's new parameters for 150 steps (~5 s),
+  and reports the held-out loss change overall, per cluster and on non-hard tokens.
+- **Unchanged from shake1:** same fixed core (2x2x64, d=32), same 4000-step trial, same keep rule
+  (beat the best by 0.005), 6 iterations.
+
+| iter | shake1 (blind) | fast1 (informed) | what fast1 added |
+|---|---|---|---|
+| 1 | 1.5232 | 1.5204 | Kneser-Ney order-6 table + in-context copy reader |
+| 2 | rejected | 1.5135 | table tuning chosen on true-val table-only loss |
+| 3 | rejected | 1.5050 | sharper table distribution |
+| 4 | rejected | 1.4983 | mixture of table orders |
+| 5 | 1.5064 | (1.4942, under the 0.005 margin) | context-bucketed mixture |
+| 6 | 1.4982 | **1.4915** | bucketed mixture + k-gram-6 reader at site 1 + "context order" reader at site 2 |
+| kept / cost | 3 of 6 / ~$3.2 | 5 of 6 / ~$6.6 | |
+
+- **The informed loop improves steadily:** 5 of 6 iterations kept, against 3 of 6 for shake1. It
+  matched shake1's final loss at iteration 4 and ended 0.007 lower. It found in-context copying in
+  iteration 1; shake1 never tried it. Each iteration cost ~2× as much because the agent ran its own
+  experiments.
+- **The fast scorer misjudges lookup tables.** It trains and measures on training text, so it
+  rewards tables that memorize the corpus: it rated a word-context table −0.089 (better) and the
+  winning table +0.057 (worse), both opposite to real val. From iteration 2 on, the agent built its
+  own dev split (last 10% of the training text) and used the scorer only for readers and sites. Fix:
+  the scorer needs a held-out-from-table-fit split. **It worked for the "what/where" of readers, not
+  for the tables themselves.**
+- **Most of the remaining gain is table engineering** (KN smoothing, order mixing, bucketing), not
+  new kinds of code. The clusters mostly show word-start and mid-word uncertainty, which no exact
+  rule removes.
+- **Single run,** so ±0.005 between iterations is close to seed noise (see the hygiene section).
