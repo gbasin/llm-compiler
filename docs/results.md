@@ -160,3 +160,15 @@ match), read at site 0. Both grown from empty.
 Code improves copy-span loss and ends with a 12% smaller core. But copied tokens are deterministic
 (ideal ≈ 0): the network doesn't fully trust the op because short spurious suffix matches are common in
 HMM text and it can't tell it's inside a copy span — again an interface/routing bottleneck, not compute.
+
+### Tiny Shakespeare (char-level, d=32, grown from empty; val = last 10% of text)
+| run | final arch (heads, mlp per layer) | final core | val loss (nats/char) | wall time |
+|---|---|---|---|---|
+| grown, no code | (1,8) (4,56) (2,16) | 17,072 | 2.073 | 15 min |
+| grown + suffix-match code | (1,8) (3,56) (2,24) | 16,568 | **1.932** | 39 min |
+
+At matched core size the code run is ~0.14 nats/char better (≈13k core: 1.99 vs 2.14); it reaches the
+no-code run's final loss (2.07) at ~11.4k core, i.e. ~33% fewer core params for the same loss. (Core
+includes ~4.4k params of embeddings/unembedding at vocab 65.) Growth stopped in both when no candidate
+beat the control — at this data/step scale the policy, not just capacity, limits further growth.
+The pure-Python suffix op makes training ~2.6× slower; worth vectorizing.
