@@ -201,7 +201,7 @@ class ChainLM(nn.Module):
                     it2, ok2, J = self.items2(b)
                 bias = None
                 if self.chain:  # pass-1 choice steers pass-2 reading
-                    m1 = w1.view(*w1.shape[:2], len(KS), NCONT).sum(-1)  # (B,T,C)
+                    m1 = w1[..., :len(KS) * NCONT].reshape(*w1.shape[:2], len(KS), NCONT).sum(-1)  # (B,T,C)
                     bias = (self.chain_scale * torch.log(m1.clamp(min=1e-4)))[..., None].expand(-1, -1, -1, J).flatten(2)
                 r, w2 = self.r2(h, it2, ok2, bias)
             h = h + r
