@@ -120,6 +120,7 @@ def main():
     ap.add_argument("--k_train", type=int, default=6)
     ap.add_argument("--curriculum", action="store_true", help="start at 1 hop, add a hop when train acc > 0.9")
     ap.add_argument("--step_emb", action="store_true")
+    ap.add_argument("--loop_follow", action="store_true", help="train with T in [kcur, kcur+2] (short loops first)")
     ap.add_argument("--no_inject", action="store_true")
     ap.add_argument("--steps", type=int, default=20000)
     ap.add_argument("--bs", type=int, default=128)
@@ -154,7 +155,12 @@ def main():
         if step == a.steps:
             break
         tok, y, k = task.sample(a.bs, g, kmin=1, kmax=kcur)
-        T = int(torch.randint(a.tmin, a.tmax + 1, (1,), generator=g)) if a.arm == "looped" else 1
+        if a.arm != "looped":
+            T = 1
+        elif a.loop_follow:  # loop length grows with the hop curriculum: T in [kcur, kcur + 2]
+            T = int(torch.randint(kcur, kcur + 3, (1,), generator=g))
+        else:
+            T = int(torch.randint(a.tmin, a.tmax + 1, (1,), generator=g))
         lg = model(tok, T=T)
         loss = F.cross_entropy(lg, y)
         accs = (accs + [(lg.argmax(-1) == y).float().mean().item()])[-50:]
