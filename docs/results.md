@@ -547,3 +547,75 @@ slightly off.
   against the best result with code rather than against plain cores of equal size. So no shrink was
   ever adopted, even though smaller-core-plus-code is better than the plain larger core.
 - **Single seed throughout:** per-iteration differences under ~0.01 are noise.
+
+## M9 — looped reasoning core with callable experts, rungs 0–6 (`loop.py`, `loop_expert.py`, `loop_calc.py`, `loop_words.py`)
+**Design:**
+- **Core:** one small transformer unit applied in a loop.
+- **Calls:** between loop steps, query heads call code experts.
+- **Results:** come back on the next step through a register.
+  - In the soft (label-free) mode, the register is a distribution, so calls stay exact and differentiable: the
+    expert answers every candidate query and the core weights them.
+  - The labeled mode adds supervised query labels as training wheels.
+- **Lexicon:** embeddings and positions count outside the core.
+
+**Rung 0 — loop alone, k-hop pointer chasing** (permutation of 12 symbols as pairs, query last):
+- **Training:** up to 6 hops, with a hop curriculum, and loop length grows with it (T ∈ [k, k+2]).
+- **Plain stacks:**
+  - 2 blocks (75k) learn 1–2 hops;
+  - 8 blocks (274k) learn up to ~5 (6 hops: 55%).
+- **Looped:**
+  - a single looped block (33–41k) never leaves chance, with or without input injection;
+  - **a weight-tied loop of 2 blocks (66k, no injection adapter) learns 1–6 hops at 100%, one hop per
+    loop** (k hops needs T ≥ k loops) and stays stable with extra loops;
+  - it does not extrapolate past 6 hops (8 hops: 18% at any T).
+- **Takeaway:** the loop does work. One "hop" needs a 2-layer unit, and loops must start short.
+
+**Rungs 1–3 — callable lookup expert** (same task, tiny 11.5k core, 1 head, d=32):
+
+| model | core weights | 1–6 hops (trained) | 7–11 hops | 12 hops (T≥16) |
+|---|---|---|---|---|
+| tiny core, no expert | 11.5k | chance | chance | chance |
+| expert, labeled queries, + hop-counter sensor | 11.5k | 100% | 100% | 90% |
+| **expert, soft (no labels), + hop-counter sensor** | 11.5k | **100%** | **99–100%** | **99%** |
+| expert, soft, no counter | 11.5k | 100% | ~20% | fails; drifts when over-looped |
+
+The hop-counter sensor is code that gives "hops remaining: 0 / 1 / 2+" (rung 1). Knowing when to stop is the hard part,
+and a code counter solves it. A core 24× smaller than the 8-block stack does twice the hops and extrapolates.
+
+**Rung 5 — chained calculator calls** (mod-50 chains "LOAD x op a op b …", train ≤ 4 ops, test ≤ 8):
+
+| model | core weights | 1–4 ops | 5–8 ops |
+|---|---|---|---|
+| plain stack 2 / 8 blocks | 75k / 274k | chance | chance |
+| caller, slot addressing (query picks step index), soft | 11.5k | 98–100% | chance |
+| **caller, program-counter addressing, labeled** | 11.5k | **100%** | **100%** |
+| caller, program-counter addressing, soft | 11.5k | 100% | 5–6 ops 96–100%, 7–8 fail; sensitive to loop count |
+
+**Design rule:** queries must be relative or content-addressed. Absolute slot indices never extrapolate,
+because untrained slots can't be selected.
+
+**Rung 6 — multi-step word problems:**
+- **Task:** char-level text, numbers as digits or words, distractor sentences and in-sentence distractor numbers,
+  e.g. "At 3 o'clock she finds 12 more".
+- **Division of labor:** code does the sentence cursor, number parsing and exact mod-100 arithmetic; the
+  core decides each sentence's operation (load / add / subtract / multiply / skip) and which number is
+  the operand.
+- **Training:** 1–3 steps.
+
+| model | core weights | 1 step | 2 | 3 | 4 | 6 | held-out phrasings (1 step) |
+|---|---|---|---|---|---|---|---|
+| plain 4 / 8 blocks | 133k / 266k | 58–59% | 26–32% | 11–15% | 3–5% | 2–4% | 20–27% |
+| caller, labeled | 23k | 100% | 100% | 99% | 91% | 52% | 30% |
+| **caller, soft (no labels)** | 23k | **100%** | **100%** | **100%** | **99.6%** | **72%** | 26% |
+
+The label-free caller learns the language-to-call mapping from the answer alone and extrapolates in
+length. Held-out phrasings fail for every model, because they use verbs never seen in training (4 templates
+per operation). Language generalization is the core's job, and it needs real text: that is rung 7.
+
+**Overall:**
+- **Tiny looped cores with callable experts beat plain networks 10–24× larger** on every symbolic rung, and
+  extrapolate to longer chains.
+- **Soft candidate queries match or beat labels on lookups and language,** but are fragile about stopping and
+  loop count.
+- **Plain looping works only with a 2-block unit and a curriculum.**
+- **Single seed throughout.**
