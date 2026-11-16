@@ -651,7 +651,46 @@ per operation). Language generalization is the core's job, and it needs real tex
   where the core forms the query.
 - **The training budget is tiny** (41M tokens). Pythia saw ~7000× more data, so its numbers are only a reference.
 
-**v3 (char-level, only core size counts) status:** with an order-12 table plus v2's experts, the core shrank
-19.0k → 14.8k → 12.6k → 10.6k → 7.9k → 5.3k → 4.3k → **3.7k (attention only, no MLP) at 1.293**. That
-is still better than a plain 685k network (1.440), with the hidden Pile transfer at 2.23 against 2.58. The
-run continues.
+**v3 (char-level, only core size counts), final:** with an order-12 table plus v2's experts, the core
+shrank down the whole ladder, 19.0k → 14.8k → 12.6k → 10.6k → 7.9k → 5.3k → 4.3k → 3.7k → 3.2k →
+**1.6k (one block, no attention heads, no MLP, d=8) at 1.302**. That still beats a plain 685k network (1.440),
+with the hidden Pile transfer at 2.25 against 2.58. The run was stopped at iteration 2: the agent had hit its
+usage limit, and there was no smaller core left on the ladder.
+- **This is a degenerate result.** It says that at char level, an n-gram table plus a handful of symbolic
+  experts outperforms any network we can train here. It does not say a reasoning core emerged: the core is
+  essentially a readout. This is why the work moved to the looped/callable design on BPE text.
+
+## M11 — callable retrieval on real text (`lm8.py`)
+**Setup:**
+- **Same data and budget as M10.**
+- **Expert** (code + data, run live in data workers): the suffix array over Pile tokens 0–30M answers a menu
+  of queries, "what followed the last k tokens?" for k ∈ {1,2,3,4,5,6,8}. Each answer is the 4 tokens that
+  followed one random corpus occurrence, plus a log2 occurrence count. That is 28 retrieved items per position.
+- **No infini-gram probability proposals** from M10 are used here; the core only gets raw retrieved
+  continuations.
+- **Core:** between loops, the core reads the items with per-position attention (query = its state, plus a
+  null item). In other words, it chooses which lookup to trust and what to take from it. The result is added
+  to the state for the next loop.
+- **Proposal port:** the read mass on each candidate becomes a logit bonus for that candidate's next token.
+- **Copy port:** as in M10.
+
+| model | core weights | val loss |
+|---|---|---|
+| M10 best: 2-block loop×3 + sensor experts (infini-gram probs + copy) | 396k | 4.988 |
+| **read, 2-block loop×3 (choice + proposal + copy)** | 396k | **4.923** |
+| **read, no proposal port** | 396k | **4.921** |
+| read, 1 pass (no loop) | 396k | 4.971 |
+| read, loop×3, **uniform weights (no choice)** | 396k | 4.994 |
+
+- **Choice matters.** Fixing the read weights to uniform costs 0.07 nats, the largest gap in the table. With
+  choice, the core puts most mass on the null item (~75%) and spreads the rest toward k = 2–3. Uniform
+  weighting is dominated by short, noisy k = 1 matches.
+- **Looping helps with callable retrieval:** −0.05 for 3 loops against 1 pass. In M10, with sensor experts,
+  it was within noise.
+- **The proposal port is redundant once the core can read:** 4.921 vs 4.923. The core takes what it needs
+  through attention.
+- **Callable retrieval beats M10's best** (4.92 vs 4.99), even though it receives no frequency
+  distributions. It sees only one sampled continuation per query.
+- **Single seed.** The 0.05–0.07 gaps are larger than the ~0.03 noise level estimated in M10, but not by much.
+- **Next:** chained lookups, where the loop-t query depends on what loop t−1 read. After that, bring back the
+  discovery agent to write callable experts.
