@@ -619,3 +619,39 @@ per operation). Language generalization is the core's job, and it needs real tex
   loop count.
 - **Plain looping works only with a 2-block unit and a curriculum.**
 - **Single seed throughout.**
+
+## M10 — rung 7: real text (Pile, Pythia BPE) with a looped core and experts (`lm7.py`)
+**Setup:**
+- **Data:** Pile tokens 30M–100M for training. Validation is 256 windows of 256 tokens from held-out Pile val
+  docs.
+- **Training:** 10k steps of 16×256 tokens (~41M tokens), d=128, tied embedding/unembedding (the lexicon,
+  outside the core) and learned positions.
+- **Core:** one or more pre-LN blocks, optionally looped with shared weights.
+- **Experts,** wired as gated next-token proposal ports:
+  - **infini-gram:** longest match of the context in a suffix array over Pile tokens 0–30M (never trained
+    on), proposing its top-4 next tokens with their probabilities and the match length;
+  - **copy:** the token that followed the latest earlier occurrence of the last 1/2/3 tokens.
+
+| model | core weights | val loss (nats/token) |
+|---|---|---|
+| plain, 1 block + experts | 198k | 5.047 |
+| plain, 2 blocks | 396k | 5.457 |
+| 2-block unit looped 3× | 396k | 5.518 |
+| **plain, 2 blocks + experts** | 396k | **5.014** |
+| **2-block unit looped 3× + experts** | 396k | **4.988** |
+| plain, 4 blocks | 791k | 5.375 |
+| plain, 8 blocks | 1.58M | 5.144 |
+| Pythia-14M / 70M / 160M (≈300B tokens, reference only) | ~1.2M / 19M / 85M | 3.673 / 3.115 / 2.732 |
+
+- **Experts beat an 8× larger core on real text.** One block plus experts (198k) beats 8 plain blocks
+  (1.58M) by 0.10. Adding experts to the 2-block core gains 0.44.
+- **Looping:** without experts, looping 3× is slightly worse than one pass (+0.06). With experts it is
+  slightly better (−0.03). That is within single-seed noise, so it is not a claim yet.
+- **These experts are sensor-style** (proposals computed from the text). The next step is callable retrieval,
+  where the core forms the query.
+- **The training budget is tiny** (41M tokens). Pythia saw ~7000× more data, so its numbers are only a reference.
+
+**v3 (char-level, only core size counts) status:** with an order-12 table plus v2's experts, the core shrank
+19.0k → 14.8k → 12.6k → 10.6k → 7.9k → 5.3k → 4.3k → **3.7k (attention only, no MLP) at 1.293**. That
+is still better than a plain 685k network (1.440), with the hidden Pile transfer at 2.23 against 2.58. The
+run continues.
